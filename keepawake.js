@@ -1,0 +1,413 @@
+#!/usr/bin/env node
+// Keep the machine awake while a Claude Code turn is in progress. Windows, macOS, Linux; no
+// dependencies beyond node.
+//
+//   keepawake.js busy      UserPromptSubmit: set the busy marker, ensure one holder for the session
+//   keepawake.js beat      Pre/PostToolUse(+Failure), async: refresh the marker's mtime if it exists
+//   keepawake.js idle      Stop / StopFailure: clear the marker (the turn is done)
+//   keepawake.js stop      SessionEnd: clear the marker and kill the holder
+//   keepawake.js hold <s>  internal: the detached holder for session <s>
+//   keepawake.js selftest  runnable check (touches nothing outside a temp dir; ~6s)
+//
+// One detached holder per session owns an OS sleep inhibitor and polls the marker file. It lets go
+// when the marker is gone for GRACE_MS (turn finished), when the marker has not been refreshed for
+// STALE_MS (turn presumed dead: Esc does not fire Stop, a crash fires nothing), or when you have
+// been away past the cap. Display sleep is left alone. Mechanisms:
+//   win32   a hidden powershell holding SetThreadExecutionState(ES_SYSTEM_REQUIRED)
+//   darwin  caffeinate -i -w <holder pid>
+//   linux   systemd-inhibit --what=sleep:idle ... cat
+// Each is released by the OS if the holder dies (stdin pipe closes / -w target exits), so a killed
+// holder cannot leave a stuck inhibitor.
+//
+// ponytail: the "away" cap uses real input-idle time where it can be read (win32 GetLastInputInfo,
+// macOS HIDIdleTime, Linux xprintidle on X11). Where it cannot (Wayland without xprintidle) it falls
+// back to wall-clock time since this busy period began, which also caps a legitimately long turn.
+// ponytail: no Modern Standby tuning. If holding ES_SYSTEM_REQUIRED does not survive the display
+// turning off on a given Windows laptop, the upgrade is PowerCreateRequest/ExecutionRequired.
+// ponytail: a silent tool call longer than STALE_MS is released early. Raise STALE_MS if builds outlast it.
+// ponytail: PermissionRequest/Notification do not refresh the marker; they mean waiting on you, not working.
+// ponytail: Stop does not fire on Esc and background tasks can outlive Stop; both are bounded by STALE_MS / GRACE_MS.
+'use strict';
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const cp = require('child_process');
+
+const env = process.env;
+// Env overrides exist for selftest only; nothing in hooks.json sets them.
+const STATE_DIR = env.KEEPAWAKE_DIR || path.join(os.homedir(), '.claude', 'keepawake');
+const POLL_MS = +env.KEEPAWAKE_POLL_MS || 30000;
+const STALE_MS = +env.KEEPAWAKE_STALE_MS || 45 * 60000;
+const GRACE_MS = env.KEEPAWAKE_GRACE_MS !== undefined ? +env.KEEPAWAKE_GRACE_MS : 5 * 60000;
+const CAP_AC_MS = 6 * 3600000;
+const CAP_BAT_MS = 3 * 3600000;
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const markerPath = (s) => path.join(STATE_DIR, s + '.busy');
+const pidPath = (s) => path.join(STATE_DIR, s + '.pid');
+
+// stdin is untrusted and the id becomes a filename. Absent id -> null: never share a marker.
+function sessionId(payload) {
+  const id = payload && payload.session_id;
+  return id ? String(id).replace(/[^A-Za-z0-9_-]/g, '_') : null;
+}
+
+function readPayload() {
+  if (process.stdin.isTTY) return {};
+  try { return JSON.parse(fs.readFileSync(0, 'utf8').replace(/^﻿/, '')); } catch { return {}; }
+}
+
+function mtimeOf(p) { try { return fs.statSync(p).mtimeMs; } catch { return null; } }
+function touch(p) { const n = new Date(); fs.utimesSync(p, n, n); }
+
+// The whole release policy, pure so selftest can drive it. `mtime` is null when the marker is gone.
+// Returns { release: 'done'|'stale'|'cap' } or { goneSince } (hold; carry goneSince to the next call).
+function decide({ now, mtime, idleMs, capMs, goneSince }) {
+  if (mtime == null) {
+    const since = goneSince == null ? now : goneSince;
+    return now - since >= GRACE_MS ? { release: 'done' } : { goneSince: since };
+  }
+  if (now - mtime >= STALE_MS) return { release: 'stale' };
+  if (idleMs >= capMs) return { release: 'cap' };
+  return {};
+}
+
+// ---------------------------------------------------------------- holder liveness
+function alive(pid) {
+  try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
+}
+// The holder refreshes its pid file every poll, so a recycled PID whose file has gone quiet is
+// never mistaken for a holder (and never killed by `stop`).
+function holderPid(sess) {
+  const pf = pidPath(sess);
+  try {
+    const pid = parseInt(fs.readFileSync(pf, 'utf8'), 10);
+    const fresh = Date.now() - fs.statSync(pf).mtimeMs < 3 * POLL_MS + 5000;
+    return pid > 0 && fresh && alive(pid) ? pid : 0;
+  } catch { return 0; }
+}
+
+// ---------------------------------------------------------------- hook modes
+function cmdBusy(sess) {
+  fs.mkdirSync(STATE_DIR, { recursive: true });
+  const mf = markerPath(sess);
+  if (fs.existsSync(mf)) touch(mf); else fs.writeFileSync(mf, '');
+  if (holderPid(sess)) return;
+  const child = cp.spawn(process.execPath, [__filename, 'hold', sess], {
+    detached: true, stdio: 'ignore', windowsHide: true, env,
+  });
+  child.unref();
+  fs.writeFileSync(pidPath(sess), String(child.pid));
+}
+
+function cmdBeat(sess) {
+  const mf = markerPath(sess);
+  // Only an existing marker: a late async hook after Stop must not resurrect a busy session.
+  if (fs.existsSync(mf)) { try { touch(mf); } catch { /* raced a delete */ } }
+}
+
+function cmdIdle(sess) { fs.rmSync(markerPath(sess), { force: true }); }
+
+function cmdStop(sess) {
+  cmdIdle(sess); // the holder would release anyway if the kill below loses the race
+  const pid = holderPid(sess);
+  if (pid) { try { process.kill(pid); } catch { /* already gone */ } }
+  fs.rmSync(pidPath(sess), { force: true });
+}
+
+// ---------------------------------------------------------------- backends
+// start() -> { ask(q: 'idle'|'ac') -> Promise<number|null>, stop(), child }
+//   idle: ms since last user input (null if unknown); ac: 0 on battery, anything else = mains/unknown.
+
+const WIN_SCRIPT = `
+$ErrorActionPreference = 'Stop'
+Add-Type -Namespace KA -Name N -MemberDefinition '
+[DllImport("kernel32.dll")] public static extern uint SetThreadExecutionState(uint f);
+[DllImport("kernel32.dll")] public static extern bool GetSystemPowerStatus(byte[] b);
+[DllImport("user32.dll")] public static extern bool GetLastInputInfo(byte[] p);
+[DllImport("kernel32.dll")] public static extern uint GetTickCount();
+public static uint IdleMs() {
+  byte[] b = new byte[8]; b[0] = 8;
+  if (!GetLastInputInfo(b)) return uint.MaxValue;
+  uint now = GetTickCount();
+  uint idle = now - System.BitConverter.ToUInt32(b, 4);
+  return idle > now ? 0 : idle;
+}
+public static int Ac() { byte[] b = new byte[12]; return GetSystemPowerStatus(b) ? b[0] : -1; }
+'
+if ([KA.N]::SetThreadExecutionState([uint32]2147483649) -eq 0) { exit 1 }
+'ready'
+while (($l = [Console]::In.ReadLine()) -ne $null) {
+  if ($l -eq 'idle') { [KA.N]::IdleMs() } elseif ($l -eq 'ac') { [KA.N]::Ac() }
+}
+`;
+
+function winBackend() {
+  const child = cp.spawn('powershell.exe', [
+    '-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand',
+    Buffer.from(WIN_SCRIPT, 'utf16le').toString('base64'),
+  ], { stdio: ['pipe', 'pipe', 'ignore'], windowsHide: true });
+  const lines = [];
+  const waiters = [];
+  let buf = '';
+  child.stdout.on('data', (d) => {
+    buf += d;
+    let i;
+    while ((i = buf.indexOf('\n')) >= 0) {
+      const l = buf.slice(0, i).trim();
+      buf = buf.slice(i + 1);
+      const w = waiters.shift();
+      if (w) w(l); else lines.push(l);
+    }
+  });
+  const next = (ms) => new Promise((res) => {
+    if (lines.length) return res(lines.shift());
+    const t = setTimeout(() => { waiters.splice(waiters.indexOf(w), 1); res(null); }, ms);
+    const w = (l) => { clearTimeout(t); res(l); };
+    waiters.push(w);
+  });
+  const stop = () => { try { child.stdin.end(); child.kill(); } catch { /* gone */ } };
+  return next(15000).then((l) => {
+    if (l !== 'ready') { stop(); throw new Error('Windows refused the sleep request (or powershell could not start it)'); }
+    return {
+      child, stop,
+      async ask(q) {
+        child.stdin.write(q + '\n');
+        const n = Number(await next(5000));
+        return Number.isNaN(n) ? null : q === 'idle' && n === 4294967295 ? null : n;
+      },
+    };
+  });
+}
+
+function spawnedBackend(cmd, args, ask) {
+  const child = cp.spawn(cmd, args, { stdio: ['pipe', 'ignore', 'ignore'] });
+  let failed = null;
+  child.once('error', (e) => { failed = e; });
+  // An inhibitor that dies at once (missing binary, polkit denial) must read as a failure.
+  return sleep(1000).then(() => {
+    if (failed || child.exitCode !== null) throw new Error(`${cmd} could not hold a sleep lock${failed ? ': ' + failed.code : ''}`);
+    return { child, ask: async (q) => ask(q), stop: () => { try { child.stdin.end(); child.kill(); } catch { /* gone */ } } };
+  });
+}
+
+function execOut(cmd, args) {
+  try { return cp.execFileSync(cmd, args, { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] }); } catch { return null; }
+}
+
+function macAsk(q) {
+  if (q === 'idle') {
+    const m = /"HIDIdleTime"\s*=\s*(\d+)/.exec(execOut('ioreg', ['-c', 'IOHIDSystem', '-d', '4']) || '');
+    return m ? Math.round(Number(m[1]) / 1e6) : null; // nanoseconds
+  }
+  return /Battery Power/.test(execOut('pmset', ['-g', 'batt']) || '') ? 0 : 1;
+}
+
+function linuxAsk(q) {
+  if (q === 'idle') {
+    const n = parseInt(execOut('xprintidle', []) || '', 10);
+    return Number.isNaN(n) ? null : n;
+  }
+  try {
+    const d = '/sys/class/power_supply';
+    let mains = false;
+    for (const n of fs.readdirSync(d)) {
+      if (fs.readFileSync(`${d}/${n}/type`, 'utf8').trim() !== 'Mains') continue;
+      mains = true;
+      if (fs.readFileSync(`${d}/${n}/online`, 'utf8').trim() === '1') return 1;
+    }
+    return mains ? 0 : 1; // no Mains supply at all = a desktop
+  } catch { return 1; }
+}
+
+function startBackend() {
+  if (process.platform === 'win32') return winBackend();
+  if (process.platform === 'darwin') return spawnedBackend('caffeinate', ['-i', '-w', String(process.pid)], macAsk);
+  if (process.platform === 'linux') {
+    return spawnedBackend('systemd-inhibit', ['--what=sleep:idle', '--who=claude-keepawake',
+      '--why=Claude Code turn in progress', '--mode=block', 'cat'], linuxAsk);
+  }
+  return Promise.reject(new Error(`unsupported platform: ${process.platform}`));
+}
+
+// ---------------------------------------------------------------- notifications (best effort)
+const WIN_TOAST = `
+$null = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
+$null = [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime]
+$x = New-Object Windows.Data.Xml.Dom.XmlDocument
+$t = [System.Security.SecurityElement]::Escape($env:KA_TITLE); $b = [System.Security.SecurityElement]::Escape($env:KA_TEXT)
+$x.LoadXml("<toast><visual><binding template='ToastGeneric'><text>$t</text><text>$b</text></binding></visual></toast>")
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe').Show([Windows.UI.Notifications.ToastNotification]::new($x))
+`;
+
+// Resolves when the notifier has exited (or 8s), so a holder about to exit does not cut it off.
+function notify(title, text) {
+  return new Promise((resolve) => {
+    let cmd, args;
+    const e = { ...env, KA_TITLE: title, KA_TEXT: text };
+    if (process.platform === 'win32') {
+      cmd = 'powershell.exe';
+      args = ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(WIN_TOAST, 'utf16le').toString('base64')];
+    } else if (process.platform === 'darwin') {
+      cmd = 'osascript';
+      args = ['-e', 'display notification (system attribute "KA_TEXT") with title (system attribute "KA_TITLE")'];
+    } else {
+      cmd = 'notify-send';
+      args = [title, text];
+    }
+    try {
+      const c = cp.spawn(cmd, args, { stdio: 'ignore', windowsHide: true, env: e });
+      c.once('error', resolve);
+      c.once('exit', resolve);
+      setTimeout(resolve, 8000).unref();
+    } catch { resolve(); }
+  });
+}
+
+// ---------------------------------------------------------------- the holder
+const mins = (ms) => Math.round(ms / 60000);
+
+async function hold(sess) {
+  const mf = markerPath(sess);
+  const pf = pidPath(sess);
+  const beat = () => { try { touch(pf); } catch { /* pid file not written yet, or removed by stop */ } };
+  beat();
+  let be;
+  try { be = await startBackend(); } catch (e) {
+    await notify('Keep-awake failed', `${e.message}. This session will not hold the machine awake.`);
+    process.exit(1);
+  }
+  beat(); // starting the backend can take seconds; keep the pid file fresh for holderPid()
+  let releasing = false;
+  be.child.once('exit', async () => {
+    if (releasing) return;
+    await notify('Keep-awake lost', 'The sleep lock process exited unexpectedly; sleep is allowed again.');
+    process.exit(1);
+  });
+  const onAc = async () => (await be.ask('ac')) !== 0;
+  const capMs = (ac) => (ac ? CAP_AC_MS : CAP_BAT_MS);
+
+  let ac = await onAc();
+  let goneSince;
+  let busySince = Date.now();
+  for (;;) {
+    await sleep(POLL_MS);
+    beat();
+
+    const nowAc = await onAc();
+    if (nowAc !== ac) {
+      ac = nowAc;
+      const idle = (await be.ask('idle')) ?? Date.now() - busySince;
+      const left = Math.max(0, mins(capMs(ac) - idle));
+      notify('Keep-awake limit changed', `${ac ? 'Plugged in' : 'On battery'} -- keep-awake now allows ${capMs(ac) / 3600000}h without input; about ${left} min left before the machine may sleep.`);
+    }
+
+    const now = Date.now();
+    const mtime = mtimeOf(mf);
+    if (mtime != null && goneSince != null) busySince = now; // a new turn began inside the grace
+    const idleMs = (await be.ask('idle')) ?? now - busySince;
+    const r = decide({ now, mtime, idleMs, capMs: capMs(ac), goneSince });
+    goneSince = r.goneSince;
+    if (!r.release) continue;
+
+    releasing = true;
+    be.stop();
+    // Only an early release changes when the machine may sleep under work you did not know was cut off.
+    if (r.release === 'stale') await notify('Keep-awake released', `No Claude activity for ${mins(STALE_MS)} min -- the turn looks stuck or was interrupted. Sleep is allowed again.`);
+    if (r.release === 'cap') await notify('Keep-awake released', `No input for ${capMs(ac) / 3600000}h (${ac ? 'AC' : 'battery'} limit). Claude may still be working, but the machine can now sleep.`);
+    fs.rmSync(pf, { force: true });
+    process.exit(0);
+  }
+}
+
+// ---------------------------------------------------------------- selftest
+async function selftest() {
+  const assert = require('assert');
+  const T = Date.now();
+  const base = { now: T, idleMs: 0, capMs: CAP_AC_MS };
+
+  // decide(): the whole policy
+  assert.deepStrictEqual(decide({ ...base, mtime: T }), {}, 'fresh marker holds');
+  assert.deepStrictEqual(decide({ ...base, mtime: T - STALE_MS - 1 }), { release: 'stale' });
+  assert.deepStrictEqual(decide({ ...base, mtime: T, idleMs: CAP_AC_MS }), { release: 'cap' });
+  assert.deepStrictEqual(decide({ ...base, mtime: null }), { goneSince: T }, 'gone starts the grace');
+  assert.deepStrictEqual(decide({ ...base, mtime: null, goneSince: T - GRACE_MS + 1000 }), { goneSince: T - GRACE_MS + 1000 }, 'inside grace holds');
+  assert.deepStrictEqual(decide({ ...base, mtime: null, goneSince: T - GRACE_MS }), { release: 'done' }, 'grace over releases');
+  assert.deepStrictEqual(decide({ ...base, mtime: T, goneSince: T - 1000 }), {}, 'returning marker resets the grace');
+  assert.strictEqual(decide({ ...base, mtime: T - STALE_MS - 1, goneSince: T }).release, 'stale', 'stale gets no grace');
+
+  assert.strictEqual(sessionId({ session_id: 'a/b..c' }), 'a_b__c');
+  assert.strictEqual(sessionId({}), null);
+
+  // backend smoke: can hold, and the readings are sane
+  const be = await startBackend();
+  try {
+    const idle = await be.ask('idle');
+    assert.ok(idle === null || (idle >= 0 && idle <= os.uptime() * 1000 + 5000), `idle reading out of range: ${idle}`);
+    assert.ok([null, 0, 1, 255].includes(await be.ask('ac')), 'ac reading out of range');
+  } finally { be.stop(); }
+
+  // end to end in a temp dir, on short timers
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ka-selftest-'));
+  const e2 = { ...env, KEEPAWAKE_DIR: dir, KEEPAWAKE_POLL_MS: '300', KEEPAWAKE_GRACE_MS: '2500', KEEPAWAKE_STALE_MS: '3600000' };
+  const run = (mode, id) => cp.spawnSync(process.execPath, [__filename, mode], { env: e2, input: JSON.stringify({ session_id: id }), timeout: 15000 });
+  const S = 'selftest';
+  const pidOf = () => parseInt(fs.readFileSync(path.join(dir, S + '.pid'), 'utf8'), 10);
+  try {
+    run('beat', S);
+    assert.ok(!fs.existsSync(path.join(dir, S + '.busy')), 'beat created a marker');
+
+    run('busy', S);
+    const pid = pidOf();
+    await sleep(2500); // let the holder get its inhibitor
+    assert.ok(alive(pid), 'holder not running after busy');
+    const mf = path.join(dir, S + '.busy');
+    const old = new Date(Date.now() - 5000);
+    fs.utimesSync(mf, old, old);
+    run('beat', S);
+    assert.ok(Date.now() - mtimeOf(mf) < 3000, 'beat did not refresh the marker');
+
+    run('busy', S);
+    assert.strictEqual(pidOf(), pid, 'second busy started a second holder');
+
+    run('idle', S);
+    await sleep(1000);
+    assert.ok(alive(pid), 'holder released inside the grace window');
+    run('busy', S); // a new turn inside the grace carries on with the same holder
+    assert.strictEqual(pidOf(), pid, 'busy inside the grace did not reuse the holder');
+    await sleep(1000);
+    assert.ok(alive(pid), 'holder released with the marker back');
+
+    run('idle', S);
+    await sleep(2500 + 1500);
+    assert.ok(!alive(pid), 'holder still running after the grace');
+
+    run('busy', S);
+    const pid2 = pidOf();
+    await sleep(2000);
+    assert.ok(alive(pid2));
+    run('stop', S);
+    await sleep(800);
+    assert.ok(!alive(pid2), 'stop did not kill the holder');
+    assert.ok(!fs.existsSync(mf), 'stop left the marker');
+  } finally {
+    try { process.kill(pidOf()); } catch { /* gone */ }
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+  console.log(`keepawake: selftest ok (${process.platform}, stale ${mins(STALE_MS)}m, grace ${mins(GRACE_MS)}m)`);
+}
+
+// ---------------------------------------------------------------- main
+const mode = process.argv[2];
+if (mode === 'selftest') {
+  selftest().catch((e) => { console.error('keepawake: selftest FAILED:', e.message); process.exit(1); });
+} else if (mode === 'hold') {
+  hold(process.argv[3]).catch(() => process.exit(1));
+} else if (['busy', 'beat', 'idle', 'stop'].includes(mode)) {
+  const sess = sessionId(readPayload());
+  if (sess) ({ busy: cmdBusy, beat: cmdBeat, idle: cmdIdle, stop: cmdStop })[mode](sess);
+  process.exit(0);
+} else {
+  console.error('usage: keepawake.js busy|beat|idle|stop|hold <session>|selftest');
+  process.exit(2);
+}

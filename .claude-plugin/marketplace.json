@@ -1,0 +1,14 @@
+{
+  "name": "agentic-keepawake",
+  "description": "Keep the machine awake while a Claude Code turn is running.",
+  "owner": {
+    "name": "abhisheksarkar30"
+  },
+  "plugins": [
+    {
+      "name": "agentic-keepawake",
+      "source": "./",
+      "description": "Holds an OS sleep lock only while a Claude Code turn is in progress. Windows, macOS, Linux."
+    }
+  ]
+}
