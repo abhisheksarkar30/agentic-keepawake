@@ -1,0 +1,23 @@
+name: Selftest
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  selftest:
+    # Same convention as the other repos: set the RUNS_ON repo variable (e.g. ["self-hosted","rog"])
+    # once a self-hosted runner is registered to this repo; until then it runs on GitHub-hosted ubuntu.
+    runs-on: ${{ fromJSON(vars.RUNS_ON || '"ubuntu-latest"') }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Selftest
+        run: node keepawake.js selftest
