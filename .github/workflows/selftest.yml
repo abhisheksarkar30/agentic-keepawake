@@ -20,4 +20,9 @@ jobs:
         with:
           node-version: 20
       - name: Selftest
+        # The rog runner is a systemd user service in WSL with no logind session, so systemd-inhibit is denied
+        # there (it prints "Failed to inhibit: Access denied"). Run the full lifecycle with the no-op backend;
+        # run a plain `node keepawake.js selftest` on a real desktop to cover the OS lock itself.
+        env:
+          KEEPAWAKE_BACKEND: ${{ runner.os == 'Linux' && 'none' || '' }}
         run: node keepawake.js selftest

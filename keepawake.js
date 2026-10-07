@@ -6,6 +6,9 @@
 //   keepawake.js beat      Pre/PostToolUse(+Failure), async: refresh the marker's mtime if it exists
 //   keepawake.js idle      Stop / StopFailure: clear the marker (the turn is done)
 //   keepawake.js stop      SessionEnd: clear the marker and kill the holder
+//   keepawake.js status    print each session's state, its holder, and whether keep-awake is paused
+//   keepawake.js pause [m] stop holding the machine awake (for m minutes, else until `resume`)
+//   keepawake.js resume    undo `pause`
 //   keepawake.js hold <s>  internal: the detached holder for session <s>
 //   keepawake.js selftest  runnable check (touches nothing outside a temp dir; ~6s)
 //
@@ -16,6 +19,8 @@
 //   win32   a hidden powershell holding SetThreadExecutionState(ES_SYSTEM_REQUIRED)
 //   darwin  caffeinate -i -w <holder pid>
 //   linux   systemd-inhibit --what=sleep:idle ... cat
+// KEEPAWAKE_BACKEND=none runs holders with no OS lock at all (CI on a runner that has no logind
+// session, where systemd-inhibit is denied); everything else, including pause, behaves the same.
 // Each is released by the OS if the holder dies (stdin pipe closes / -w target exits), so a killed
 // holder cannot leave a stuck inhibitor.
 //
@@ -85,6 +90,49 @@ function holderPid(sess) {
     const fresh = Date.now() - fs.statSync(pf).mtimeMs < 3 * POLL_MS + 5000;
     return pid > 0 && fresh && alive(pid) ? pid : 0;
   } catch { return 0; }
+}
+
+// ---------------------------------------------------------------- pause / status
+// One global flag file (not per session): its content is an expiry in epoch ms, or 0 for "until resume".
+const pausePath = () => path.join(STATE_DIR, 'paused');
+function isPaused() {
+  try {
+    const until = parseInt(fs.readFileSync(pausePath(), 'utf8'), 10) || 0;
+    if (until && Date.now() >= until) { fs.rmSync(pausePath(), { force: true }); return false; }
+    return true;
+  } catch { return false; }
+}
+function cmdPause(minutes) {
+  fs.mkdirSync(STATE_DIR, { recursive: true });
+  const m = Number(minutes);
+  fs.writeFileSync(pausePath(), String(m > 0 ? Date.now() + m * 60000 : 0));
+  console.log(m > 0 ? `keepawake: paused for ${m} min (holders release their lock within ${POLL_MS / 1000}s)`
+    : 'keepawake: paused until `keepawake.js resume` (holders release their lock within ' + POLL_MS / 1000 + 's)');
+}
+function cmdResume() { fs.rmSync(pausePath(), { force: true }); console.log('keepawake: resumed'); }
+
+const ago = (ms) => (ms < 90000 ? `${Math.round(ms / 1000)}s` : `${Math.round(ms / 60000)}m`);
+function statusLines() {
+  const out = [isPaused() ? 'paused: yes (no sleep lock is held; `keepawake.js resume` to undo)' : 'paused: no'];
+  let ids = [];
+  try {
+    ids = [...new Set(fs.readdirSync(STATE_DIR).filter((f) => /\.(busy|pid)$/.test(f)).map((f) => f.replace(/\.(busy|pid)$/, '')))];
+  } catch { /* no state dir yet */ }
+  if (!ids.length) out.push('no sessions');
+  for (const id of ids) {
+    const mt = mtimeOf(markerPath(id));
+    const hp = holderPid(id);
+    const holder = hp ? `holder pid ${hp}` : 'no holder';
+    if (mt != null) {
+      const age = Date.now() - mt;
+      out.push(age >= STALE_MS
+        ? `${id}: stale marker (no activity for ${ago(age)}; the turn is presumed dead), ${holder}`
+        : `${id}: turn running, last activity ${ago(age)} ago, ${holder}, stale release in ${ago(STALE_MS - age)}`);
+    } else if (hp) {
+      out.push(`${id}: turn finished, ${holder} (grace period, then releases)`);
+    }
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------- hook modes
@@ -181,12 +229,16 @@ function winBackend() {
 }
 
 function spawnedBackend(cmd, args, ask) {
-  const child = cp.spawn(cmd, args, { stdio: ['pipe', 'ignore', 'ignore'] });
+  const child = cp.spawn(cmd, args, { stdio: ['pipe', 'ignore', 'pipe'] });
   let failed = null;
+  let err = '';
   child.once('error', (e) => { failed = e; });
+  child.stderr.on('data', (d) => { err += d; });
   // An inhibitor that dies at once (missing binary, polkit denial) must read as a failure.
   return sleep(1000).then(() => {
-    if (failed || child.exitCode !== null) throw new Error(`${cmd} could not hold a sleep lock${failed ? ': ' + failed.code : ''}`);
+    if (failed || child.exitCode !== null) {
+      throw new Error(`${cmd} could not hold a sleep lock: ${(failed && failed.code) || err.trim() || 'exit ' + child.exitCode}`);
+    }
     return { child, ask: async (q) => ask(q), stop: () => { try { child.stdin.end(); child.kill(); } catch { /* gone */ } } };
   });
 }
@@ -221,6 +273,10 @@ function linuxAsk(q) {
 }
 
 function startBackend() {
+  if (env.KEEPAWAKE_BACKEND === 'none') {
+    const child = new (require('events').EventEmitter)();
+    return Promise.resolve({ child, stop() {}, ask: async (q) => (q === 'idle' ? null : 1) });
+  }
   if (process.platform === 'win32') return winBackend();
   if (process.platform === 'darwin') return spawnedBackend('caffeinate', ['-i', '-w', String(process.pid)], macAsk);
   if (process.platform === 'linux') {
@@ -272,32 +328,42 @@ async function hold(sess) {
   const pf = pidPath(sess);
   const beat = () => { try { touch(pf); } catch { /* pid file not written yet, or removed by stop */ } };
   beat();
-  let be;
-  try { be = await startBackend(); } catch (e) {
-    await notify('Keep-awake failed', `${e.message}. This session will not hold the machine awake.`);
-    process.exit(1);
-  }
-  beat(); // starting the backend can take seconds; keep the pid file fresh for holderPid()
-  let releasing = false;
-  be.child.once('exit', async () => {
-    if (releasing) return;
-    await notify('Keep-awake lost', 'The sleep lock process exited unexpectedly; sleep is allowed again.');
-    process.exit(1);
-  });
-  const onAc = async () => (await be.ask('ac')) !== 0;
+
+  // The backend is acquired and dropped as `pause` / `resume` come and go; `be` is null while paused.
+  let be = null;
+  const acquire = async () => {
+    try { be = await startBackend(); } catch (e) {
+      await notify('Keep-awake failed', `${e.message}. This session will not hold the machine awake.`);
+      process.exit(1);
+    }
+    beat(); // starting the backend can take seconds; keep the pid file fresh for holderPid()
+    const mine = be;
+    be.child.once('exit', async () => {
+      if (mine.dropped) return;
+      await notify('Keep-awake lost', 'The sleep lock process exited unexpectedly; sleep is allowed again.');
+      process.exit(1);
+    });
+  };
+  const drop = () => { if (be) { be.dropped = true; be.stop(); be = null; } };
+  // While paused there is no backend to ask: ac keeps its last value and idle falls back to wall clock.
+  const ask = async (q) => (be ? be.ask(q) : null);
   const capMs = (ac) => (ac ? CAP_AC_MS : CAP_BAT_MS);
 
-  let ac = await onAc();
+  if (!isPaused()) await acquire();
+  let ac = (await ask('ac')) !== 0;
   let goneSince;
   let busySince = Date.now();
   for (;;) {
     await sleep(POLL_MS);
     beat();
 
-    const nowAc = await onAc();
+    if (isPaused()) drop(); else if (!be) await acquire();
+
+    const q = await ask('ac');
+    const nowAc = q == null ? ac : q !== 0;
     if (nowAc !== ac) {
       ac = nowAc;
-      const idle = (await be.ask('idle')) ?? Date.now() - busySince;
+      const idle = (await ask('idle')) ?? Date.now() - busySince;
       const left = Math.max(0, mins(capMs(ac) - idle));
       notify('Keep-awake limit changed', `${ac ? 'Plugged in' : 'On battery'} -- keep-awake now allows ${capMs(ac) / 3600000}h without input; about ${left} min left before the machine may sleep.`);
     }
@@ -305,13 +371,12 @@ async function hold(sess) {
     const now = Date.now();
     const mtime = mtimeOf(mf);
     if (mtime != null && goneSince != null) busySince = now; // a new turn began inside the grace
-    const idleMs = (await be.ask('idle')) ?? now - busySince;
+    const idleMs = (await ask('idle')) ?? now - busySince;
     const r = decide({ now, mtime, idleMs, capMs: capMs(ac), goneSince });
     goneSince = r.goneSince;
     if (!r.release) continue;
 
-    releasing = true;
-    be.stop();
+    drop();
     // Only an early release changes when the machine may sleep under work you did not know was cut off.
     if (r.release === 'stale') await notify('Keep-awake released', `No Claude activity for ${mins(STALE_MS)} min -- the turn looks stuck or was interrupted. Sleep is allowed again.`);
     if (r.release === 'cap') await notify('Keep-awake released', `No input for ${capMs(ac) / 3600000}h (${ac ? 'AC' : 'battery'} limit). Claude may still be working, but the machine can now sleep.`);
@@ -370,7 +435,22 @@ async function selftest() {
     run('busy', S);
     assert.strictEqual(pidOf(), pid, 'second busy started a second holder');
 
+    // status / pause / resume
+    const out = (m, ...a) => cp.spawnSync(process.execPath, [__filename, m, ...a], { env: e2, encoding: 'utf8', timeout: 15000 }).stdout;
+    assert.match(out('status'), /selftest: turn running.*holder pid \d+/, 'status misses the running session');
+    assert.match(out('status'), /paused: no/);
+    out('pause');
+    assert.match(out('status'), /paused: yes/);
+    await sleep(1000);
+    assert.ok(alive(pid), 'holder died while paused');
+    out('resume');
+    assert.match(out('status'), /paused: no/);
+    fs.writeFileSync(path.join(dir, 'paused'), String(Date.now() - 1000));
+    assert.match(out('status'), /paused: no/, 'an expired pause still reads as paused');
+    assert.ok(!fs.existsSync(path.join(dir, 'paused')), 'expired pause file not cleaned up');
+
     run('idle', S);
+    assert.match(out('status'), /selftest: turn finished.*grace/, 'status misses the grace state');
     await sleep(1000);
     assert.ok(alive(pid), 'holder released inside the grace window');
     run('busy', S); // a new turn inside the grace carries on with the same holder
@@ -403,11 +483,17 @@ if (mode === 'selftest') {
   selftest().catch((e) => { console.error('keepawake: selftest FAILED:', e.message); process.exit(1); });
 } else if (mode === 'hold') {
   hold(process.argv[3]).catch(() => process.exit(1));
+} else if (mode === 'status') {
+  console.log(statusLines().join(String.fromCharCode(10)));
+} else if (mode === 'pause') {
+  cmdPause(process.argv[3]);
+} else if (mode === 'resume') {
+  cmdResume();
 } else if (['busy', 'beat', 'idle', 'stop'].includes(mode)) {
   const sess = sessionId(readPayload());
   if (sess) ({ busy: cmdBusy, beat: cmdBeat, idle: cmdIdle, stop: cmdStop })[mode](sess);
   process.exit(0);
 } else {
-  console.error('usage: keepawake.js busy|beat|idle|stop|hold <session>|selftest');
+  console.error('usage: keepawake.js busy|beat|idle|stop|status|pause [minutes]|resume|hold <session>|selftest');
   process.exit(2);
 }

@@ -58,6 +58,22 @@ A normal turn-finished release stays silent, or every prompt would notify.
 `stop` only kills a pid whose pid file the holder has refreshed recently, so a recycled PID is never
 terminated by mistake.
 
+## Inspect and control
+
+```
+node keepawake.js status        # each session: running / finished (in grace) / stale marker, its holder pid
+node keepawake.js pause [min]   # stop holding the machine awake (for min minutes, else until resume)
+node keepawake.js resume
+```
+
+`pause` is one global flag file (`~/.claude/keepawake/paused`). Holders notice it within one poll (30 s),
+release their sleep lock, and take it back on `resume` or when the timed pause expires; the turn, marker
+and grace logic carry on meanwhile. There is deliberately no tray icon: these three commands plus the
+notifications cover it without a per-OS GUI dependency.
+
+`KEEPAWAKE_BACKEND=none` runs everything without taking any OS lock. It exists for CI on a runner with no
+logind session, where `systemd-inhibit` is denied (`Failed to inhibit: Access denied`).
+
 ## Check
 
 ```
