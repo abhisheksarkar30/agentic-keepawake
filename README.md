@@ -105,3 +105,7 @@ Design drew on [stanley-projects/Insomnia](https://github.com/stanley-projects/I
 liveness fallback), [dakotahp/agentic-insomnia](https://github.com/dakotahp/agentic-insomnia) (post-turn
 grace, stdin-pipe crash release, native backends) and
 [benbasha/Claude-Autopilot](https://github.com/benbasha/Claude-Autopilot) (what not to do).
+
+## License
+
+[MIT](LICENSE).
