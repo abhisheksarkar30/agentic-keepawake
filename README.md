@@ -58,6 +58,31 @@ A normal turn-finished release stays silent, or every prompt would notify.
 `stop` only kills a pid whose pid file the holder has refreshed recently, so a recycled PID is never
 terminated by mistake.
 
+## Self-hosted GitHub Actions runners
+
+Separate from the Claude hooks: keeps the machine awake while a local runner is **executing a job**,
+not merely because the runner service is up. An idle runner (`Runner.Listener` waiting) holds nothing;
+the lock is taken when a `Runner.Worker` process appears and released when the last one is gone.
+
+```
+node keepawake.js install-runners     # Windows: start the watcher at every login (and now)
+node keepawake.js runners             # start it now, once (any OS; no-op if already running)
+node keepawake.js uninstall-runners   # stop it and remove it from login
+```
+
+One detached watcher per machine polls every 30 s. It reuses the same OS lock, `pause`/`resume`, grace
+period (5 min, so back-to-back jobs do not flap) and AC/battery caps (6 h / 3 h) as the Claude hooks.
+The cap counts from when the lock was taken, not from input idle: a job is meant to run while you are
+away. After a cap release it re-arms only once the runners have been quiet. `status` shows whether the
+watcher is idle or holding.
+
+On Windows it checks `Runner.Worker.exe` and, if a WSL distro is already running, `pgrep -x Runner.Worker`
+inside the default distro (never starting WSL just to look). On macOS/Linux it uses `pgrep`.
+
+`install-runners` drops a hidden `.vbs` in your Startup folder (no admin needed) that pins this copy's
+path: re-run it after a plugin update moves the script. On Linux/macOS, run `keepawake.js runners` from a
+systemd user unit or launchd agent instead. Runners in a non-default WSL distro are not seen.
+
 ## Inspect and control
 
 ```
@@ -81,7 +106,8 @@ node keepawake.js selftest
 ```
 
 Drives the whole release policy as a pure function, smoke-tests the backend for the current OS, then runs
-a real holder end to end in a temp dir on short timers (~6 s).
+a real holder end to end in a temp dir on short timers, then the runner watcher with a file standing in for
+`Runner.Worker` (~20 s).
 
 ## Status
 

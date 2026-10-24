@@ -3,7 +3,7 @@
   "author": {
     "name": "abhisheksarkar30"
   },
-  "description": "Keeps the machine awake only while a Claude Code turn is in progress. Windows, macOS and Linux; no Electron, no dependencies beyond node.",
+  "description": "Keeps the machine awake only while a Claude Code turn is in progress, or a local GitHub Actions runner is executing a job. Windows, macOS and Linux; no Electron, no dependencies beyond node.",
   "license": "MIT",
-  "version": "0.2.0"
+  "version": "0.3.0"
 }

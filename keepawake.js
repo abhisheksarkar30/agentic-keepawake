@@ -10,7 +10,9 @@
 //   keepawake.js pause [m] stop holding the machine awake (for m minutes, else until `resume`)
 //   keepawake.js resume    undo `pause`
 //   keepawake.js hold <s>  internal: the detached holder for session <s>
-//   keepawake.js selftest  runnable check (touches nothing outside a temp dir; ~6s)
+//   keepawake.js runners   start the GitHub Actions runner watcher (detached, one per machine)
+//   keepawake.js install-runners / uninstall-runners   (Windows) start the watcher at every login
+//   keepawake.js selftest  runnable check (touches nothing outside a temp dir; ~20s)
 //
 // One detached holder per session owns an OS sleep inhibitor and polls the marker file. It lets go
 // when the marker is gone for GRACE_MS (turn finished), when the marker has not been refreshed for
@@ -32,6 +34,14 @@
 // ponytail: a silent tool call longer than STALE_MS is released early. Raise STALE_MS if builds outlast it.
 // ponytail: PermissionRequest/Notification do not refresh the marker; they mean waiting on you, not working.
 // ponytail: Stop does not fire on Esc and background tasks can outlive Stop; both are bounded by STALE_MS / GRACE_MS.
+//
+// Runner watcher: a self-hosted GitHub Actions runner is "working" only while its Runner.Worker
+// process exists (Runner.Listener just waits for jobs, so an idle runner holds nothing). One detached
+// watcher per machine polls for it and holds the same OS lock, with the same AC/battery caps (measured
+// from when the lock was taken, not from input idle: a job is meant to run while you are away) and the
+// same grace between back-to-back jobs. On Windows it also looks inside the running WSL distro, where
+// the Linux runners live; it never starts WSL just to look.
+// ponytail: WSL is probed in the default distro only. Runners in another distro need `wsl -d <name>`.
 'use strict';
 const fs = require('fs');
 const path = require('path');
@@ -50,6 +60,8 @@ const CAP_BAT_MS = 3 * 3600000;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const markerPath = (s) => path.join(STATE_DIR, s + '.busy');
 const pidPath = (s) => path.join(STATE_DIR, s + '.pid');
+const RUNNERS = 'runners'; // the watcher's "session" name; real session ids are uuids
+const heldPath = () => path.join(STATE_DIR, RUNNERS + '.held'); // exists while the watcher holds the lock
 
 // stdin is untrusted and the id becomes a filename. Absent id -> null: never share a marker.
 function sessionId(payload) {
@@ -123,7 +135,9 @@ function statusLines() {
     const mt = mtimeOf(markerPath(id));
     const hp = holderPid(id);
     const holder = hp ? `holder pid ${hp}` : 'no holder';
-    if (mt != null) {
+    if (id === RUNNERS) {
+      if (hp) out.push(`runner watcher: ${holder}, ${mtimeOf(heldPath()) != null ? 'holding the machine awake (job running)' : 'idle (no job running)'}`);
+    } else if (mt != null) {
       const age = Date.now() - mt;
       out.push(age >= STALE_MS
         ? `${id}: stale marker (no activity for ${ago(age)}; the turn is presumed dead), ${holder}`
@@ -190,10 +204,11 @@ while (($l = [Console]::In.ReadLine()) -ne $null) {
 }
 `;
 
-function winBackend() {
+// A hidden powershell we talk to over stdin/stdout, one line per exchange: { child, next(ms), stop() }.
+function psSession(script) {
   const child = cp.spawn('powershell.exe', [
     '-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand',
-    Buffer.from(WIN_SCRIPT, 'utf16le').toString('base64'),
+    Buffer.from(script, 'utf16le').toString('base64'),
   ], { stdio: ['pipe', 'pipe', 'ignore'], windowsHide: true });
   const lines = [];
   const waiters = [];
@@ -215,6 +230,11 @@ function winBackend() {
     waiters.push(w);
   });
   const stop = () => { try { child.stdin.end(); child.kill(); } catch { /* gone */ } };
+  return { child, next, stop };
+}
+
+function winBackend() {
+  const { child, next, stop } = psSession(WIN_SCRIPT);
   return next(15000).then((l) => {
     if (l !== 'ready') { stop(); throw new Error('Windows refused the sleep request (or powershell could not start it)'); }
     return {
@@ -385,6 +405,117 @@ async function hold(sess) {
   }
 }
 
+// ---------------------------------------------------------------- runner watcher
+// True while any runner on this machine is executing a job. KEEPAWAKE_RUNNER_FILE (selftest only)
+// stands in for the process: a job is "running" while that file exists.
+//
+// Windows: the watcher is detached, so it has no console, and every console program it ran itself
+// (tasklist, wsl) would allocate a fresh one and flash a terminal window each poll. Instead one
+// long-lived hidden powershell does the probing: its children inherit that hidden console.
+// `wsl -l --running -q` prints UTF-16 distro names, one per line (none running: a sentence with
+// spaces). Only a distro that is already up is asked: `wsl -e` would otherwise boot the VM.
+const PROBE_SCRIPT = `
+while (($l = [Console]::In.ReadLine()) -ne $null) {
+  $j = [bool](Get-Process -Name Runner.Worker -ErrorAction SilentlyContinue)
+  if (-not $j) {
+    $up = (& wsl.exe -l --running -q 2>$null | Out-String) -replace "\`0", ''
+    if ($up -match '(?m)^\\S+\\s*$') { & wsl.exe -e pgrep -x Runner.Worker *> $null; $j = ($LASTEXITCODE -eq 0) }
+  }
+  if ($j) { 1 } else { 0 }
+}
+`;
+let probe = null;
+async function runnerJobs() {
+  if (env.KEEPAWAKE_RUNNER_FILE) return fs.existsSync(env.KEEPAWAKE_RUNNER_FILE);
+  if (process.platform !== 'win32') {
+    try { cp.execFileSync('pgrep', ['-x', 'Runner.Worker'], { stdio: 'ignore', timeout: 8000 }); return true; } catch { return false; }
+  }
+  try {
+    if (!probe) { probe = psSession(PROBE_SCRIPT); const mine = probe; mine.child.once('exit', () => { if (probe === mine) probe = null; }); }
+    probe.child.stdin.write('?\n');
+    const r = await probe.next(20000);
+    if (r == null) { probe.stop(); probe = null; } // a late answer would be read as the next poll's
+    return r === '1';
+  } catch { probe = null; return false; }
+}
+
+async function watchRunners() {
+  const pf = pidPath(RUNNERS);
+  const hf = heldPath();
+  fs.rmSync(hf, { force: true });
+  let be = null;
+  let held; // when the lock was taken
+  let goneSince;
+  let capped = false; // gave up (cap hit or lock refused): re-arm only once the runners go quiet
+  const drop = () => { if (be) { be.dropped = true; be.stop(); be = null; } fs.rmSync(hf, { force: true }); };
+  for (;;) {
+    try { touch(pf); } catch { /* pid file not written yet */ }
+    const jobs = await runnerJobs();
+    const now = Date.now();
+    if (!jobs) capped = false;
+    if (isPaused() || capped) { drop(); held = goneSince = undefined; } else if (jobs || be) { // be set = in the grace
+      if (!be) {
+        try {
+          be = await startBackend();
+          const mine = be;
+          be.child.once('exit', () => { if (!mine.dropped) { be = null; fs.rmSync(hf, { force: true }); } }); // re-taken next poll
+          held = Date.now();
+          fs.writeFileSync(hf, '');
+        } catch (e) {
+          capped = true;
+          await notify('Keep-awake failed', `${e.message}. Runner jobs will not hold the machine awake.`);
+        }
+      }
+      if (be) {
+        const ac = (await be.ask('ac')) !== 0;
+        const capMs = ac ? CAP_AC_MS : CAP_BAT_MS;
+        const r = decide({ now, mtime: jobs ? now : null, idleMs: now - held, capMs, goneSince });
+        goneSince = r.goneSince;
+        if (r.release) {
+          drop();
+          held = undefined;
+          if (r.release === 'cap') {
+            capped = true;
+            await notify('Keep-awake released', `Runner jobs have held the machine awake for ${capMs / 3600000}h (${ac ? 'AC' : 'battery'} limit). A job may still be running, but the machine can now sleep.`);
+          }
+        }
+      }
+    }
+    await sleep(POLL_MS);
+  }
+}
+
+function cmdRunners() {
+  fs.mkdirSync(STATE_DIR, { recursive: true });
+  const pid = holderPid(RUNNERS);
+  if (pid) return console.log(`keepawake: runner watcher already running (pid ${pid})`);
+  const child = cp.spawn(process.execPath, [__filename, 'runners-watch'], { detached: true, stdio: 'ignore', windowsHide: true, env });
+  child.unref();
+  fs.writeFileSync(pidPath(RUNNERS), String(child.pid));
+  console.log(`keepawake: runner watcher started (pid ${child.pid})`);
+}
+
+// Windows: a hidden .vbs in the user's Startup folder (no admin needed, unlike a logon scheduled task).
+// It pins the paths of this copy of the script, so re-run install-runners after a plugin update.
+const startupVbs = () => path.join(env.APPDATA || '', 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'agentic-keepawake-runners.vbs');
+function cmdInstallRunners() {
+  if (process.platform !== 'win32') {
+    console.error('install-runners is Windows only. Elsewhere, run `node keepawake.js runners` from a systemd user unit or launchd agent.');
+    process.exit(1);
+  }
+  fs.writeFileSync(startupVbs(), `CreateObject("WScript.Shell").Run """${process.execPath}"" ""${__filename}"" runners", 0, False\r\n`);
+  console.log(`keepawake: will start the runner watcher at login (${startupVbs()})`);
+  cmdRunners();
+}
+function cmdUninstallRunners() {
+  fs.rmSync(startupVbs(), { force: true });
+  const pid = holderPid(RUNNERS);
+  if (pid) { try { process.kill(pid); } catch { /* already gone */ } }
+  fs.rmSync(pidPath(RUNNERS), { force: true });
+  fs.rmSync(heldPath(), { force: true });
+  console.log('keepawake: runner watcher stopped and removed from login');
+}
+
 // ---------------------------------------------------------------- selftest
 async function selftest() {
   const assert = require('assert');
@@ -418,6 +549,7 @@ async function selftest() {
   const run = (mode, id) => cp.spawnSync(process.execPath, [__filename, mode], { env: e2, input: JSON.stringify({ session_id: id }), timeout: 15000 });
   const S = 'selftest';
   const pidOf = () => parseInt(fs.readFileSync(path.join(dir, S + '.pid'), 'utf8'), 10);
+  const rpidOf = () => parseInt(fs.readFileSync(path.join(dir, RUNNERS + '.pid'), 'utf8'), 10);
   try {
     run('beat', S);
     assert.ok(!fs.existsSync(path.join(dir, S + '.busy')), 'beat created a marker');
@@ -470,7 +602,27 @@ async function selftest() {
     await sleep(800);
     assert.ok(!alive(pid2), 'stop did not kill the holder');
     assert.ok(!fs.existsSync(mf), 'stop left the marker');
+
+    // runner watcher, with a file standing in for Runner.Worker
+    const job = path.join(dir, 'job');
+    const e3 = { ...e2, KEEPAWAKE_RUNNER_FILE: job };
+    const startR = () => cp.spawnSync(process.execPath, [__filename, 'runners'], { env: e3, timeout: 15000 });
+    const stat = () => cp.spawnSync(process.execPath, [__filename, 'status'], { env: e3, encoding: 'utf8', timeout: 15000 }).stdout;
+    const until = async (fn, ms) => { for (const t = Date.now(); Date.now() - t < ms; await sleep(200)) if (fn()) return true; return false; };
+    startR();
+    assert.ok(await until(() => /runner watcher: .*idle/.test(stat()), 5000), 'watcher not idle with no job');
+    const rpid = rpidOf();
+    startR();
+    assert.strictEqual(rpidOf(), rpid, 'second `runners` started a second watcher');
+    fs.writeFileSync(job, '');
+    assert.ok(await until(() => /holding the machine awake/.test(stat()), 10000), 'watcher did not hold for a job');
+    fs.rmSync(job);
+    await sleep(1200);
+    assert.match(stat(), /holding/, 'watcher released inside the grace');
+    assert.ok(await until(() => /runner watcher: .*idle/.test(stat()), 6000), 'watcher still holding after the grace');
+    assert.ok(alive(rpid), 'watcher exited instead of going idle');
   } finally {
+    try { process.kill(rpidOf()); } catch { /* gone or never started */ }
     try { process.kill(pidOf()); } catch { /* gone */ }
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -485,6 +637,14 @@ if (mode === 'selftest') {
   hold(process.argv[3]).catch(() => process.exit(1));
 } else if (mode === 'status') {
   console.log(statusLines().join(String.fromCharCode(10)));
+} else if (mode === 'runners') {
+  cmdRunners();
+} else if (mode === 'runners-watch') {
+  watchRunners().catch(() => process.exit(1));
+} else if (mode === 'install-runners') {
+  cmdInstallRunners();
+} else if (mode === 'uninstall-runners') {
+  cmdUninstallRunners();
 } else if (mode === 'pause') {
   cmdPause(process.argv[3]);
 } else if (mode === 'resume') {
@@ -494,6 +654,6 @@ if (mode === 'selftest') {
   if (sess) ({ busy: cmdBusy, beat: cmdBeat, idle: cmdIdle, stop: cmdStop })[mode](sess);
   process.exit(0);
 } else {
-  console.error('usage: keepawake.js busy|beat|idle|stop|status|pause [minutes]|resume|hold <session>|selftest');
+  console.error('usage: keepawake.js busy|beat|idle|stop|status|pause [minutes]|resume|hold <session>|runners|install-runners|uninstall-runners|selftest');
   process.exit(2);
 }
