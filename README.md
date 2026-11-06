@@ -18,6 +18,41 @@ Local marketplace (loads in place; `/reload-plugins` after edits):
 Needs `node` on PATH. If it is missing the hooks fail visibly in the transcript; there is no silent
 degraded mode.
 
+## OpenCode
+
+The OpenCode version is `opencode/index.ts` — same holder, same policy, no dependency on the Claude
+hook bridge. Point OpenCode at the directory:
+
+```jsonc
+// ~/.config/opencode/opencode.jsonc
+{
+  "plugins": [{ "package": "D:/github/agentic-keepawake/opencode" }]
+}
+```
+
+Then `/reload`. If you copy `index.ts` anywhere else, pass the script explicitly:
+`{ "package": "<dir>", "options": { "path": "D:/github/agentic-keepawake/keepawake.js" } }`.
+The plugin fails at load when it cannot find `keepawake.js`; `node` must be on PATH.
+
+| OpenCode | keepawake.js | Claude Code equivalent |
+|---|---|---|
+| `session.execution.started` | `busy` | `UserPromptSubmit` |
+| `prompt` hook | `busy` | `UserPromptSubmit` (admission → start gap) |
+| `tool execute.before` | `beat` | `PreToolUse` |
+| `tool execute.after` | `beat` | `PostToolUse` / `PostToolUseFailure` |
+| `session.execution.succeeded` / `failed` / `interrupted` | `idle` | `Stop` / `StopFailure` |
+| `session.idle` | `idle` | `Stop` (not emitted by every build) |
+| `session.deleted` | `stop` | `SessionEnd` |
+
+Turn boundaries come from `session.execution.*`, **not** `session.idle`: OpenCode 2.2.5 emits no
+`session.idle` when a headless turn finishes, so keying off it alone leaves the lock held until the
+45-minute stale ceiling. Interrupting a turn fires `execution.interrupted`, so Esc releases in seconds
+— the Claude hook path has to wait for the stale ceiling there.
+
+`status`, `pause`, `resume` and the runner watcher are the same `node keepawake.js …` commands. On
+OpenCode 1 (which this plugin does not target), the `claude-code-compat` adapter instead runs
+`hooks/hooks.json` as-is if this repo is one of its roots.
+
 ## How it works
 
 | Hook | Runs | Does |
