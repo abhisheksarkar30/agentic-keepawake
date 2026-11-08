@@ -5,8 +5,11 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import assert from 'node:assert';
 import plugin from './index.js';
+
+const script = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'keepawake.js');
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ka-opencode-'));
 process.env.KEEPAWAKE_DIR = dir;
@@ -83,6 +86,18 @@ async function run() {
   push('shell.deleted', { id: 'sh_2' });
   assert.ok(await wait(() => !held('opencode-shell-sh_2')), 'shell.deleted did not release');
 
+  // a background shell outlives its turn: later tool activity refreshes its marker, so it is not
+  // released at the stale ceiling (45 min) while the session keeps working
+  push('shell.created', { info: { id: 'sh_3' } });
+  assert.ok(await wait(() => held('opencode-shell-sh_3')), 'shell.created did not hold');
+  const sh3 = marker('opencode-shell-sh_3');
+  const backdated = new Date(Date.now() - 10 * 60 * 1000);
+  fs.utimesSync(sh3, backdated, backdated);
+  hooks['execute.after']({ sessionID: 's6' });
+  assert.ok(await wait(() => { try { return Date.now() - fs.statSync(sh3).mtimeMs < 5000; } catch { return false; } }), 'tool activity did not refresh the shell marker');
+  push('shell.exited', { id: 'sh_3' });
+  assert.ok(await wait(() => !held('opencode-shell-sh_3')), 'shell.exited did not release the refreshed shell');
+
   // session.wait is a release path; an older wait must not release a newer turn
   push('session.execution.started', { sessionID: 's2' });
   assert.ok(await wait(() => held('s2')), 'execution.started did not hold');
@@ -121,11 +136,26 @@ async function run() {
   assert.ok(await wait(() => !held('s5')), 'the reloaded instance did not clear its marker');
 
   // OpenCode 1 mapping
-  const v1 = await plugin.server();
+  const v1 = await plugin.server({}, {});
   await v1.event({ event: { type: 'session.status', properties: { sessionID: 'v1', status: { type: 'busy' } } } });
   assert.ok(await wait(() => held('v1')), 'v1 busy status did not hold');
   await v1.event({ event: { type: 'session.idle', properties: { sessionID: 'v1' } } });
   assert.ok(await wait(() => !held('v1')), 'v1 idle did not release');
+
+  // V1 calls `server(input, options)`: options.path is the second argument. The copy gets its own
+  // state dir, so its marker proves the copy ran rather than the package sibling.
+  const altDir = path.join(dir, 'alt');
+  fs.mkdirSync(altDir);
+  const alt = path.join(dir, 'keepawake-alt.js');
+  // Drop the shebang: prepended, it would no longer be the first line and node would reject it.
+  const src = fs.readFileSync(script, 'utf8').replace(/^#![^\n]*\n/, '');
+  fs.writeFileSync(alt, `process.env.KEEPAWAKE_DIR = ${JSON.stringify(altDir)};\n` + src);
+  const v1b = await plugin.server({}, { path: alt });
+  await v1b.event({ event: { type: 'session.status', properties: { sessionID: 'v1b', status: { type: 'busy' } } } });
+  assert.ok(await wait(() => fs.existsSync(path.join(altDir, 'v1b.busy'))), 'v1 ignored options.path');
+  assert.ok(!held('v1b'), 'v1 ran the package sibling instead of options.path');
+  await v1b.event({ event: { type: 'session.idle', properties: { sessionID: 'v1b' } } });
+  assert.ok(await wait(() => !fs.existsSync(path.join(altDir, 'v1b.busy'))), 'v1 with options.path did not release');
 }
 
 try {
@@ -136,9 +166,13 @@ try {
   process.exitCode = 1;
 } finally {
   // Holders are detached; kill them before the temp dir goes away.
-  for (const file of fs.readdirSync(dir)) {
-    if (!file.endsWith('.pid')) continue;
-    try { process.kill(parseInt(fs.readFileSync(path.join(dir, file), 'utf8'), 10)); } catch { /* gone */ }
+  for (const d of [dir, path.join(dir, 'alt')]) {
+    try {
+      for (const file of fs.readdirSync(d)) {
+        if (!file.endsWith('.pid')) continue;
+        try { process.kill(parseInt(fs.readFileSync(path.join(d, file), 'utf8'), 10)); } catch { /* gone */ }
+      }
+    } catch { /* the alt state dir may not exist */ }
   }
   await sleep(200);
   fs.rmSync(dir, { recursive: true, force: true });

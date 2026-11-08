@@ -11,6 +11,7 @@
 //   keepawake.js resume    undo `pause`
 //   keepawake.js hold <s>  internal: the detached holder for session <s>
 //   keepawake.js runners   start the GitHub Actions runner watcher (detached, one per machine)
+//   keepawake.js runners-watch   internal: the detached watcher body `runners` starts
 //   keepawake.js install-runners / uninstall-runners   (Windows) start the watcher at every login
 //   keepawake.js selftest  runnable check (touches nothing outside a temp dir; ~20s)
 //
@@ -49,7 +50,8 @@ const os = require('os');
 const cp = require('child_process');
 
 const env = process.env;
-// Env overrides exist for selftest only; nothing in hooks.json sets them.
+// KEEPAWAKE_DIR/_POLL_MS/_STALE_MS/_GRACE_MS/_RUNNER_FILE are for selftest only; KEEPAWAKE_BACKEND
+// is the documented CI/escape hatch. Nothing in hooks.json sets any of them.
 const STATE_DIR = env.KEEPAWAKE_DIR || path.join(os.homedir(), '.claude', 'keepawake');
 const POLL_MS = +env.KEEPAWAKE_POLL_MS || 30000;
 const STALE_MS = +env.KEEPAWAKE_STALE_MS || 45 * 60000;
@@ -89,18 +91,33 @@ function decide({ now, mtime, idleMs, capMs, goneSince }) {
   return {};
 }
 
+// One rule for an `ac` reading: 0 = battery, non-zero = mains, null = unknown. `last` is what a
+// holder keeps on an unknown reading; with no last reading the caller passes its default (battery).
+const acOn = (q, last) => (q == null ? last : q !== 0);
+
 // ---------------------------------------------------------------- holder liveness
 function alive(pid) {
   try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
 }
-// The holder refreshes its pid file every poll, so a recycled PID whose file has gone quiet is
-// never mistaken for a holder (and never killed by `stop`).
+// `stop`'s kill decision: the holder refreshes its pid file every poll, so a recycled PID whose file
+// has gone quiet is never killed. (A spawner asks a different question -- see liveHolderPid.)
 function holderPid(sess) {
   const pf = pidPath(sess);
   try {
     const pid = parseInt(fs.readFileSync(pf, 'utf8'), 10);
     const fresh = Date.now() - fs.statSync(pf).mtimeMs < 3 * POLL_MS + 5000;
     return pid > 0 && fresh && alive(pid) ? pid : 0;
+  } catch { return 0; }
+}
+// Spawners and `status` ask a different question from `stop`'s kill decision: "does this session
+// already have a holder?" A pid that is alive but whose file went quiet (the machine slept mid-turn)
+// is still a holder, and spawning a second one (or reporting "no holder") is the hazard. Only `stop`
+// needs the freshness check before it kills, and it clears the record only when this returns 0.
+function liveHolderPid(sess) {
+  const pf = pidPath(sess);
+  try {
+    const pid = parseInt(fs.readFileSync(pf, 'utf8'), 10);
+    return pid > 0 && alive(pid) ? pid : 0;
   } catch { return 0; }
 }
 
@@ -121,7 +138,24 @@ function cmdPause(minutes) {
   console.log(m > 0 ? `keepawake: paused for ${m} min (holders release their lock within ${POLL_MS / 1000}s)`
     : 'keepawake: paused until `keepawake.js resume` (holders release their lock within ' + POLL_MS / 1000 + 's)');
 }
-function cmdResume() { fs.rmSync(pausePath(), { force: true }); console.log('keepawake: resumed'); }
+function cmdResume() {
+  const hadPause = fs.existsSync(pausePath());
+  fs.rmSync(pausePath(), { force: true });
+  // A holder that released while paused exits for good (cap/stale), so `resume` re-arms one for
+  // every turn whose marker is still fresh -- but only if a pause was actually in effect: with none,
+  // re-arming would resurrect a holder that released on the cap (README "Known limits"). The runner
+  // watcher never exits on pause, so it needs nothing here.
+  if (hadPause) {
+    let markers = [];
+    try { markers = fs.readdirSync(STATE_DIR).filter((f) => f.endsWith('.busy')); } catch { /* no state dir yet */ }
+    for (const f of markers) {
+      const id = f.slice(0, -'.busy'.length);
+      const mt = mtimeOf(markerPath(id));
+      if (mt != null && Date.now() - mt < STALE_MS && !liveHolderPid(id)) cmdBusy(id);
+    }
+  }
+  console.log('keepawake: resumed');
+}
 
 const ago = (ms) => (ms < 90000 ? `${Math.round(ms / 1000)}s` : `${Math.round(ms / 60000)}m`);
 function statusLines() {
@@ -133,10 +167,10 @@ function statusLines() {
   if (!ids.length) out.push('no sessions');
   for (const id of ids) {
     const mt = mtimeOf(markerPath(id));
-    const hp = holderPid(id);
+    const hp = liveHolderPid(id); // same predicate the spawn gates use: status and `busy` never disagree
     const holder = hp ? `holder pid ${hp}` : 'no holder';
     if (id === RUNNERS) {
-      if (hp) out.push(`runner watcher: ${holder}, ${mtimeOf(heldPath()) != null ? 'holding the machine awake (job running)' : 'idle (no job running)'}`);
+      if (hp) out.push(`runner watcher: ${holder}, ${mtimeOf(heldPath()) != null ? 'holding the machine awake' : 'idle (not holding)'}`);
     } else if (mt != null) {
       const age = Date.now() - mt;
       out.push(age >= STALE_MS
@@ -154,12 +188,15 @@ function cmdBusy(sess) {
   fs.mkdirSync(STATE_DIR, { recursive: true });
   const mf = markerPath(sess);
   if (fs.existsSync(mf)) touch(mf); else fs.writeFileSync(mf, '');
-  if (holderPid(sess)) return;
+  if (liveHolderPid(sess)) return;
   const child = cp.spawn(process.execPath, [__filename, 'hold', sess], {
     detached: true, stdio: 'ignore', windowsHide: true, env,
   });
+  // A failed spawn emits 'error' (uncaught without a listener) and leaves child.pid undefined: write
+  // no pid file then, so the next `busy` retries instead of recording "undefined" as a holder.
+  child.on('error', () => {});
   child.unref();
-  fs.writeFileSync(pidPath(sess), String(child.pid));
+  if (Number.isFinite(child.pid)) fs.writeFileSync(pidPath(sess), String(child.pid));
 }
 
 function cmdBeat(sess) {
@@ -174,12 +211,17 @@ function cmdStop(sess) {
   cmdIdle(sess); // the holder would release anyway if the kill below loses the race
   const pid = holderPid(sess);
   if (pid) { try { process.kill(pid); } catch { /* already gone */ } }
-  fs.rmSync(pidPath(sess), { force: true });
+  // Keep the record when a live holder we did not kill still owns it (the machine slept mid-turn, so
+  // the file went stale): the next `stop` can kill it once it beats again. Nothing alive = no record.
+  if (!liveHolderPid(sess)) fs.rmSync(pidPath(sess), { force: true });
 }
 
 // ---------------------------------------------------------------- backends
 // start() -> { ask(q: 'idle'|'ac') -> Promise<number|null>, stop(), child }
-//   idle: ms since last user input (null if unknown); ac: 0 on battery, anything else = mains/unknown.
+//   idle: ms since last user input (null if unknown); ac: 0 on battery, non-zero = mains (every
+//   backend emits 1), null = unknown. Unknown always means "keep the last reading"; with no last
+//   reading yet (a holder's first ask) it means battery, the shorter and safer cap. Every consumer
+//   uses this one rule (acOn).
 
 const WIN_SCRIPT = `
 $ErrorActionPreference = 'Stop'
@@ -213,6 +255,11 @@ function psSession(script) {
   const lines = [];
   const waiters = [];
   let buf = '';
+  let planned = false; // stop() was requested: the child exit is a reset, not a lost lock
+  // A powershell that cannot start at all emits 'error'; without a listener that is an uncaught
+  // exception instead of the notify path `next(15000)` drives.
+  child.on('error', () => {});
+  child.stdin.on('error', () => {}); // the ps process can die between polls; a write must not throw
   child.stdout.on('data', (d) => {
     buf += d;
     let i;
@@ -229,23 +276,49 @@ function psSession(script) {
     const w = (l) => { clearTimeout(t); res(l); };
     waiters.push(w);
   });
-  const stop = () => { try { child.stdin.end(); child.kill(); } catch { /* gone */ } };
-  return { child, next, stop };
+  const stop = () => { planned = true; try { child.stdin.end(); child.kill(); } catch { /* gone */ } };
+  return { child, next, stop, planned: () => planned };
 }
 
-function winBackend() {
-  const { child, next, stop } = psSession(WIN_SCRIPT);
-  return next(15000).then((l) => {
-    if (l !== 'ready') { stop(); throw new Error('Windows refused the sleep request (or powershell could not start it)'); }
-    return {
-      child, stop,
-      async ask(q) {
-        child.stdin.write(q + '\n');
-        const n = Number(await next(5000));
-        return Number.isNaN(n) ? null : q === 'idle' && n === 4294967295 ? null : n;
-      },
-    };
-  });
+// One powershell reply -> a reading. A missing or empty reply means "unknown", never 0: for `ac`
+// 0 reads as "on battery", for `idle` it would disable the cap (idleMs >= capMs never true). An `ac`
+// reply outside {0,1} is unknown too: 255 is GetSystemPowerStatus' ACLineStatus "unknown" (-1 is a
+// failed query), and neither may read as mains.
+function winReading(l, q) {
+  if (l == null || l === '') return null;
+  const n = Number(l);
+  if (Number.isNaN(n)) return null;
+  if (q === 'idle') return n === 4294967295 ? null : n;
+  return n === 0 || n === 1 ? n : null;
+}
+
+function winBackend(script = WIN_SCRIPT) {
+  // `child` is a stable handle over the current ps session. A timed-out exchange discards that
+  // session (its late reply would otherwise answer the next question), but the holder's
+  // unexpected-exit listener must survive so a real death still notifies.
+  const child = new (require('events').EventEmitter)();
+  let cur = null;
+  const open = async () => {
+    const s = psSession(script);
+    s.child.once('exit', () => { if (!s.planned() && s === cur) child.emit('exit'); });
+    const l = await s.next(15000);
+    if (l !== 'ready') { s.stop(); throw new Error('Windows refused the sleep request (or powershell could not start it)'); }
+    cur = s;
+  };
+  return open().then(() => ({
+    child,
+    stop: () => { if (cur) cur.stop(); },
+    async ask(q) {
+      if (!cur) {
+        try { await open(); } catch { child.emit('exit'); return null; } // the lock really is gone
+      }
+      const s = cur;
+      s.child.stdin.write(q + '\n');
+      const l = await s.next(5000);
+      if (l == null) { s.stop(); if (cur === s) cur = null; } // timed out: drop the skewed queue
+      return winReading(l, q);
+    },
+  }));
 }
 
 function spawnedBackend(cmd, args, ask) {
@@ -253,6 +326,7 @@ function spawnedBackend(cmd, args, ask) {
   let failed = null;
   let err = '';
   child.once('error', (e) => { failed = e; });
+  child.stdin.on('error', () => {}); // the inhibitor can die between polls; stop()'s write must not throw
   child.stderr.on('data', (d) => { err += d; });
   // An inhibitor that dies at once (missing binary, polkit denial) must read as a failure.
   return sleep(1000).then(() => {
@@ -272,24 +346,33 @@ function macAsk(q) {
     const m = /"HIDIdleTime"\s*=\s*(\d+)/.exec(execOut('ioreg', ['-c', 'IOHIDSystem', '-d', '4']) || '');
     return m ? Math.round(Number(m[1]) / 1e6) : null; // nanoseconds
   }
-  return /Battery Power/.test(execOut('pmset', ['-g', 'batt']) || '') ? 0 : 1;
+  const batt = execOut('pmset', ['-g', 'batt']);
+  if (batt == null) return null; // the query failed: unknown, not mains
+  return /Battery Power/.test(batt) ? 0 : 1;
 }
 
-function linuxAsk(q) {
+function linuxAsk(q, d = '/sys/class/power_supply') { // d: selftest fixture seam
   if (q === 'idle') {
     const n = parseInt(execOut('xprintidle', []) || '', 10);
     return Number.isNaN(n) ? null : n;
   }
   try {
-    const d = '/sys/class/power_supply';
-    let mains = false;
+    let adapter = false;
+    let battery = false;
     for (const n of fs.readdirSync(d)) {
-      if (fs.readFileSync(`${d}/${n}/type`, 'utf8').trim() !== 'Mains') continue;
-      mains = true;
+      const t = fs.readFileSync(`${d}/${n}/type`, 'utf8').trim();
+      if (t === 'Battery') { battery = true; continue; }
+      if (t === 'UPS') continue;
+      // Any other supply (Mains, USB/Type-C, wireless) is a charger whose `online` is authoritative.
+      adapter = true;
       if (fs.readFileSync(`${d}/${n}/online`, 'utf8').trim() === '1') return 1;
     }
-    return mains ? 0 : 1; // no Mains supply at all = a desktop
-  } catch { return 1; }
+    // No battery at all is a desktop, always on mains. With a battery: an offline charger means the
+    // laptop is on battery; a battery we cannot tie to any adapter (some USB-C chargers expose no
+    // supply of their own) is unknown, never mains.
+    if (!battery) return 1;
+    return adapter ? 0 : null;
+  } catch { return null; } // /sys (or a supply entry) unreadable: unknown, not mains
 }
 
 function startBackend() {
@@ -354,6 +437,7 @@ async function hold(sess) {
   const acquire = async () => {
     try { be = await startBackend(); } catch (e) {
       await notify('Keep-awake failed', `${e.message}. This session will not hold the machine awake.`);
+      fs.rmSync(pf, { force: true }); // no holder left behind: the pid file must not outlive this process
       process.exit(1);
     }
     beat(); // starting the backend can take seconds; keep the pid file fresh for holderPid()
@@ -361,6 +445,7 @@ async function hold(sess) {
     be.child.once('exit', async () => {
       if (mine.dropped) return;
       await notify('Keep-awake lost', 'The sleep lock process exited unexpectedly; sleep is allowed again.');
+      fs.rmSync(pf, { force: true }); // same: this process is leaving
       process.exit(1);
     });
   };
@@ -370,7 +455,7 @@ async function hold(sess) {
   const capMs = (ac) => (ac ? CAP_AC_MS : CAP_BAT_MS);
 
   if (!isPaused()) await acquire();
-  let ac = (await ask('ac')) !== 0;
+  let ac = acOn(await ask('ac'), false); // no reading yet: assume battery (the 3h cap)
   let goneSince;
   let busySince = Date.now();
   for (;;) {
@@ -380,7 +465,7 @@ async function hold(sess) {
     if (isPaused()) drop(); else if (!be) await acquire();
 
     const q = await ask('ac');
-    const nowAc = q == null ? ac : q !== 0;
+    const nowAc = acOn(q, ac);
     if (nowAc !== ac) {
       ac = nowAc;
       const idle = (await ask('idle')) ?? Date.now() - busySince;
@@ -447,6 +532,7 @@ async function watchRunners() {
   let held; // when the lock was taken
   let goneSince;
   let capped = false; // gave up (cap hit or lock refused): re-arm only once the runners go quiet
+  let ac = false; // last known mains state; a null (unknown) reading keeps it
   const drop = () => { if (be) { be.dropped = true; be.stop(); be = null; } fs.rmSync(hf, { force: true }); };
   for (;;) {
     try { touch(pf); } catch { /* pid file not written yet */ }
@@ -467,7 +553,8 @@ async function watchRunners() {
         }
       }
       if (be) {
-        const ac = (await be.ask('ac')) !== 0;
+        const q = await be.ask('ac');
+        ac = acOn(q, ac); // unknown keeps the last reading, as the holder does
         const capMs = ac ? CAP_AC_MS : CAP_BAT_MS;
         const r = decide({ now, mtime: jobs ? now : null, idleMs: now - held, capMs, goneSince });
         goneSince = r.goneSince;
@@ -487,10 +574,13 @@ async function watchRunners() {
 
 function cmdRunners() {
   fs.mkdirSync(STATE_DIR, { recursive: true });
-  const pid = holderPid(RUNNERS);
+  const pid = liveHolderPid(RUNNERS);
   if (pid) return console.log(`keepawake: runner watcher already running (pid ${pid})`);
   const child = cp.spawn(process.execPath, [__filename, 'runners-watch'], { detached: true, stdio: 'ignore', windowsHide: true, env });
+  // Same guard as cmdBusy: a failed spawn must not write "undefined" nor report the watcher started.
+  child.on('error', (e) => console.error(`keepawake: could not start the runner watcher: ${e.message}`));
   child.unref();
+  if (!Number.isFinite(child.pid)) { process.exitCode = 1; return; }
   fs.writeFileSync(pidPath(RUNNERS), String(child.pid));
   console.log(`keepawake: runner watcher started (pid ${child.pid})`);
 }
@@ -511,8 +601,12 @@ function cmdUninstallRunners() {
   fs.rmSync(startupVbs(), { force: true });
   const pid = holderPid(RUNNERS);
   if (pid) { try { process.kill(pid); } catch { /* already gone */ } }
-  fs.rmSync(pidPath(RUNNERS), { force: true });
-  fs.rmSync(heldPath(), { force: true });
+  // Same rule as cmdStop: a quiet-but-live watcher was not killed, so its record (and hold marker)
+  // must survive for the next poll; `status` still has to describe it truthfully.
+  if (!liveHolderPid(RUNNERS)) {
+    fs.rmSync(pidPath(RUNNERS), { force: true });
+    fs.rmSync(heldPath(), { force: true });
+  }
   console.log('keepawake: runner watcher stopped and removed from login');
 }
 
@@ -535,13 +629,72 @@ async function selftest() {
   assert.strictEqual(sessionId({ session_id: 'a/b..c' }), 'a_b__c');
   assert.strictEqual(sessionId({}), null);
 
+  // a missing/empty powershell reply is "unknown", never a reading of 0 (0 = on battery / idle 0)
+  assert.strictEqual(winReading(null, 'idle'), null);
+  assert.strictEqual(winReading('', 'ac'), null);
+  assert.strictEqual(winReading('0', 'ac'), 0);
+  assert.strictEqual(winReading('0', 'idle'), 0);
+  assert.strictEqual(winReading('4294967295', 'idle'), null);
+  assert.strictEqual(winReading('nope', 'idle'), null);
+  // an `ac` reply that is not a power state (255 = ACLineStatus unknown, -1 = the query failed) is
+  // "unknown", never mains, and one rule maps unknown to the last reading (battery when there is none)
+  assert.strictEqual(winReading('1', 'ac'), 1);
+  assert.strictEqual(winReading('255', 'ac'), null);
+  assert.strictEqual(winReading('-1', 'ac'), null);
+  assert.strictEqual(winReading('2', 'ac'), null);
+  assert.strictEqual(acOn(null, false), false, 'unknown with no last reading assumes battery');
+  assert.strictEqual(acOn(null, true), true, 'unknown keeps the last reading');
+  assert.strictEqual(acOn(0, true), false);
+  assert.strictEqual(acOn(1, false), true);
+
   // backend smoke: can hold, and the readings are sane
   const be = await startBackend();
   try {
     const idle = await be.ask('idle');
     assert.ok(idle === null || (idle >= 0 && idle <= os.uptime() * 1000 + 5000), `idle reading out of range: ${idle}`);
-    assert.ok([null, 0, 1, 255].includes(await be.ask('ac')), 'ac reading out of range');
+    assert.ok([null, 0, 1].includes(await be.ask('ac')), 'ac reading out of range');
   } finally { be.stop(); }
+
+  // Linux power-supply classification: a battery with a USB-C charger is a laptop on battery, not a
+  // desktop, and a battery whose adapter state cannot be read is unknown rather than mains.
+  const ps = fs.mkdtempSync(path.join(os.tmpdir(), 'ka-selftest-ps-'));
+  try {
+    const supply = (name, type, online) => {
+      fs.mkdirSync(path.join(ps, name), { recursive: true });
+      fs.writeFileSync(path.join(ps, name, 'type'), type + '\n');
+      if (online != null) fs.writeFileSync(path.join(ps, name, 'online'), online + '\n');
+    };
+    assert.strictEqual(linuxAsk('ac', ps), 1, 'no battery at all must read as a desktop');
+    assert.strictEqual(linuxAsk('ac', path.join(ps, 'missing')), null, 'an unreadable supply set must be unknown');
+    supply('USB0', 'USB', 0);
+    assert.strictEqual(linuxAsk('ac', ps), 1, 'no battery at all is a desktop even with an offline supply');
+    supply('BAT0', 'Battery');
+    assert.strictEqual(linuxAsk('ac', ps), 0, 'a battery plus an offline USB-C charger must be on battery');
+    fs.rmSync(path.join(ps, 'USB0'), { recursive: true, force: true });
+    assert.strictEqual(linuxAsk('ac', ps), null, 'a battery with no adapter state must be unknown');
+    supply('USB0', 'USB', 1);
+    assert.strictEqual(linuxAsk('ac', ps), 1, 'a battery plus an online charger must be on mains');
+  } finally { fs.rmSync(ps, { recursive: true, force: true }); }
+
+  // A timed-out exchange must not let its late reply answer the next question: the powershell
+  // session is dropped (a planned reset, not a lost lock) and the next ask starts a fresh one.
+  if (process.platform === 'win32') {
+    const gate = path.join(os.tmpdir(), `ka-selftest-gate-${process.pid}`);
+    fs.writeFileSync(gate, '');
+    process.env.KA_SELFTEST_GATE = gate;
+    const slow = `
+'ready'
+while (($l = [Console]::In.ReadLine()) -ne $null) {
+  if ($l -eq 'idle') { if (Test-Path $env:KA_SELFTEST_GATE) { Start-Sleep -Seconds 6 }; if (Test-Path $env:KA_SELFTEST_GATE) { 1111 } else { 2222 } }
+}
+`;
+    const sb = await winBackend(slow);
+    try {
+      assert.strictEqual(await sb.ask('idle'), null, 'a timed-out reading must be unknown');
+      fs.rmSync(gate, { force: true });
+      assert.strictEqual(await sb.ask('idle'), 2222, 'the timed-out session answered the next question');
+    } finally { sb.stop(); delete process.env.KA_SELFTEST_GATE; fs.rmSync(gate, { force: true }); }
+  }
 
   // end to end in a temp dir, on short timers
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ka-selftest-'));
@@ -555,7 +708,7 @@ async function selftest() {
     assert.ok(!fs.existsSync(path.join(dir, S + '.busy')), 'beat created a marker');
 
     run('busy', S);
-    const pid = pidOf();
+    let pid = pidOf();
     await sleep(2500); // let the holder get its inhibitor
     assert.ok(alive(pid), 'holder not running after busy');
     const mf = path.join(dir, S + '.busy');
@@ -575,11 +728,35 @@ async function selftest() {
     assert.match(out('status'), /paused: yes/);
     await sleep(1000);
     assert.ok(alive(pid), 'holder died while paused');
+    // A holder that released on the cap/stale exits for good; `resume` must re-arm one for a turn
+    // that is still running (README: a released holder is re-armed by `resume`, or the next prompt).
+    try { process.kill(pid); } catch { /* gone */ }
+    fs.rmSync(path.join(dir, S + '.pid'), { force: true });
+    assert.match(out('status'), /selftest: turn running.*no holder/, 'a released holder is still reported');
     out('resume');
     assert.match(out('status'), /paused: no/);
+    await sleep(800);
+    assert.ok(fs.existsSync(path.join(dir, S + '.pid')), 'resume did not re-arm a holder for the running turn');
+    assert.notStrictEqual(pidOf(), pid, 'resume did not start a new holder');
+    pid = pidOf();
+    assert.ok(alive(pid), 'the holder resume re-armed is not running');
+    assert.match(out('status'), /selftest: turn running.*holder pid \d+/, 'resume left the turn without a holder');
     fs.writeFileSync(path.join(dir, 'paused'), String(Date.now() - 1000));
     assert.match(out('status'), /paused: no/, 'an expired pause still reads as paused');
     assert.ok(!fs.existsSync(path.join(dir, 'paused')), 'expired pause file not cleaned up');
+
+    // `resume` re-arms only when a pause was in effect: with none it must not resurrect a holder
+    // that released on the cap (README "Known limits").
+    try { process.kill(pid); } catch { /* gone */ }
+    fs.rmSync(path.join(dir, S + '.pid'), { force: true });
+    assert.match(out('status'), /selftest: turn running.*no holder/, 'a released holder is still reported');
+    out('resume');
+    await sleep(800);
+    assert.ok(!fs.existsSync(path.join(dir, S + '.pid')), 'resume with nothing paused re-armed a released holder');
+    run('busy', S); // restore the holder for the grace checks below
+    pid = pidOf();
+    await sleep(1000);
+    assert.ok(alive(pid), 'busy did not re-arm after the resume check');
 
     run('idle', S);
     assert.match(out('status'), /selftest: turn finished.*grace/, 'status misses the grace state');
@@ -602,6 +779,24 @@ async function selftest() {
     await sleep(800);
     assert.ok(!alive(pid2), 'stop did not kill the holder');
     assert.ok(!fs.existsSync(mf), 'stop left the marker');
+
+    // A live pid in the pid file is a holder even when the file has gone stale (the machine slept
+    // mid-turn): `busy` must not spawn a second holder, and `stop` keeps the freshness rule so a
+    // recycled PID is never killed -- so the record of the holder it did not kill must survive.
+    // process.pid stands in for the stale-but-live holder.
+    const S2 = 'stale-holder';
+    const pf2 = path.join(dir, S2 + '.pid');
+    fs.writeFileSync(pf2, String(process.pid));
+    const oldPid = new Date(Date.now() - 10 * 60000);
+    fs.utimesSync(pf2, oldPid, oldPid);
+    run('busy', S2);
+    assert.strictEqual(parseInt(fs.readFileSync(pf2, 'utf8'), 10), process.pid,
+      'a stale pid file with a live pid was not treated as a holder');
+    run('stop', S2);
+    assert.ok(fs.existsSync(pf2), 'stop deleted the record of a live holder it did not kill');
+    assert.strictEqual(parseInt(fs.readFileSync(pf2, 'utf8'), 10), process.pid,
+      'stop rewrote the live holder record');
+    assert.ok(alive(process.pid), 'stop killed a stale-but-live pid');
 
     // runner watcher, with a file standing in for Runner.Worker
     const job = path.join(dir, 'job');
@@ -654,6 +849,6 @@ if (mode === 'selftest') {
   if (sess) ({ busy: cmdBusy, beat: cmdBeat, idle: cmdIdle, stop: cmdStop })[mode](sess);
   process.exit(0);
 } else {
-  console.error('usage: keepawake.js busy|beat|idle|stop|status|pause [minutes]|resume|hold <session>|runners|install-runners|uninstall-runners|selftest');
+  console.error('usage: keepawake.js busy|beat|idle|stop|status|pause [minutes]|resume|hold <session>|runners|runners-watch|install-runners|uninstall-runners|selftest');
   process.exit(2);
 }

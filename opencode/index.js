@@ -114,14 +114,18 @@ export default {
       acquire(sessionID);
       waitRelease(sessionID);
     };
+    // A background shell can outlive every turn, so any activity on this instance refreshes the
+    // shell markers it owns: a working session must not let a long shell hit the stale ceiling.
+    const beatShells = () => { for (const key of owned) if (key.startsWith(SHELL)) send('beat', key); };
 
-    await ctx.session.hook('prompt', (event) => { acquire(sessionOf(event)); });
-    await ctx.session.hook('context', (event) => { acquire(sessionOf(event)); });
+    await ctx.session.hook('prompt', (event) => { acquire(sessionOf(event)); beatShells(); });
+    await ctx.session.hook('context', (event) => { acquire(sessionOf(event)); beatShells(); });
     await ctx.tool.hook('execute.before', (event) => {
       const sessionID = sessionOf(event);
       if (owned.has(sessionID)) send('beat', sessionID); else acquire(sessionID);
+      beatShells();
     });
-    await ctx.tool.hook('execute.after', (event) => { send('beat', sessionOf(event)); });
+    await ctx.tool.hook('execute.after', (event) => { send('beat', sessionOf(event)); beatShells(); });
 
     const abort = new AbortController();
     // A freshly loaded plugin can be handed the durable event-log tail, i.e. turns that ended
@@ -147,6 +151,7 @@ export default {
           switch (event.type) {
             case 'session.execution.started':
               acquireTurn(event?.data?.sessionID);
+              beatShells();
               break;
             case 'session.deleted': {
               const sessionID = event?.data?.sessionID;
@@ -185,9 +190,10 @@ export default {
     };
   },
 
-  // OpenCode 1: sessions only (its event stream has no shell events).
-  async server() {
-    const send = makeSend(resolveScript());
+  // OpenCode 1: sessions only (its event stream has no shell events). V1 calls
+  // `server(input, options)`, so the plugin options are the second argument, not a property of `input`.
+  async server(input, options) {
+    const send = makeSend(resolveScript(options));
     return {
       event: async ({ event }) => {
         const p = event?.properties || {};

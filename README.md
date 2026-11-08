@@ -30,9 +30,11 @@ holder, same policy, no dependency on the Claude hook bridge. Point OpenCode at 
 }
 ```
 
-Then `/reload`. If you copy the package anywhere else, pass the script explicitly:
-`{ "package": "<dir>", "options": { "path": "D:/github/agentic-keepawake/keepawake.js" } }`.
-The plugin fails at load when it cannot find `keepawake.js`; `node` must be on PATH.
+Then `/reload`. If you copy the package anywhere else, pass the script explicitly — V2:
+`{ "package": "<dir>", "options": { "path": "D:/github/agentic-keepawake/keepawake.js" } }`; V1:
+`"plugin": [["<dir>", { "path": "D:/github/agentic-keepawake/keepawake.js" }]]`.
+The V2 `setup` path fails at load when it cannot find `keepawake.js`; the V1 `server()` path warns
+once and holds nothing, so a V1 copy needs the `path` option if it lives elsewhere. `node` must be on PATH.
 
 | OpenCode | keepawake.js | Claude Code equivalent |
 |---|---|---|
@@ -55,16 +57,19 @@ path in case a build skips the terminal event. Unloading the plugin clears its m
 killing the holders; a reload mid-turn resumes holding at the next model or tool call.
 
 Background shells get one holder per shell under the synthetic session name `opencode-shell-<id>`:
-the turn that started one can finish while the shell still runs, so the lock follows the shell until
-it exits. Shells already running when the plugin loads are not rediscovered (the plugin context has
-no shell inventory), and a shell that outlives 45 minutes of no tool activity hits the stale ceiling.
+the turn that started one can finish while the shell still runs, so the lock follows the shell instead
+of the turn. Every tool call (and model dispatch) from the plugin refreshes each shell marker it owns,
+so a long shell outlives many turns; 45 minutes with no tool activity still hits the stale ceiling.
+Shells already running when the plugin loads are not rediscovered (the plugin context has no shell
+inventory), and a shell owned by another plugin instance is refreshed only by that instance.
 
 OpenCode 1 is supported through the plugin's `server()` export: a busy `session.status` holds, and
 `session.idle` / `session.error` release. V1 has no background-shell events and no `session.wait`.
 
 `status`, `pause`, `resume` and the runner watcher are the same `node keepawake.js …` commands.
 `node opencode/selftest.mjs` drives the plugin with a stubbed context against the real script, in a
-temp state dir with no OS lock (same as `keepawake.js selftest`).
+temp state dir with no OS lock (`KEEPAWAKE_BACKEND=none`; `keepawake.js selftest` is the one that takes
+the real OS lock unless that variable is set).
 
 ## How it works
 
@@ -140,9 +145,10 @@ node keepawake.js resume
 ```
 
 `pause` is one global flag file (`~/.claude/keepawake/paused`). Holders notice it within one poll (30 s),
-release their sleep lock, and take it back on `resume` or when the timed pause expires; the turn, marker
-and grace logic carry on meanwhile. There is deliberately no tray icon: these three commands plus the
-notifications cover it without a per-OS GUI dependency.
+release their sleep lock, and keep polling; a holder that released for good while paused (cap/stale) is
+re-armed by `resume`, not by a timed pause expiring. The turn, marker and grace logic carry on meanwhile.
+There is deliberately no tray icon: these three commands plus the notifications cover it without a per-OS
+GUI dependency.
 
 `KEEPAWAKE_BACKEND=none` runs everything without taking any OS lock. It exists for CI on a runner with no
 logind session, where `systemd-inhibit` is denied (`Failed to inhibit: Access denied`).
@@ -169,8 +175,8 @@ a real holder end to end in a temp dir on short timers, then the runner watcher 
 ## Known limits
 
 - A single silent tool call longer than 45 min is released early.
-- A holder that has released on the cap does not re-arm until the next prompt (a restart on tool activity
-  would pin the machine past the cap).
+- A holder that has released on the cap does not re-arm until the next prompt (or an explicit `pause` then
+  `resume`; a restart on tool activity would pin the machine past the cap).
 - `Stop` is not fired on Esc; the stale ceiling is the safety net.
 
 ## Prior art
