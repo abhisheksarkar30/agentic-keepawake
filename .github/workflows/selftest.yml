@@ -30,3 +30,6 @@ jobs:
         # Stubbed OpenCode context + the real keepawake.js against a temp state dir and the no-op
         # backend, so this passes on any runner OS.
         run: node opencode/selftest.mjs
+      - name: DeepSeek Harness bundle selftest
+        # Stubbed Cordis context + the real keepawake.js, same temp state dir and no-op backend.
+        run: node deepseek/test-plugin.mjs

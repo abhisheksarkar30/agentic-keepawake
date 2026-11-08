@@ -1,0 +1,5 @@
+# Bundle layer: mount the keep-awake adapter as one profile plugin.
+# The entry name is this package itself, resolved from the profile's node_modules.
+- insert:
+    - id: agentic-keepawake
+      name: agentic-keepawake-dsh

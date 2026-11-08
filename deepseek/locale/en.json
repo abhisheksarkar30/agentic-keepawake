@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Keep awake",
+    "description": "Holds an OS sleep lock only while a Harness turn or a background job is running."
+  }
+}

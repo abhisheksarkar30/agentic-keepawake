@@ -1,7 +1,8 @@
 # agentic-keepawake
 
-Keeps your machine awake **only while a Claude Code turn is actually running** — not merely because a
-session is open. Windows, macOS and Linux. One file of node, no dependencies, no Electron, no tray.
+Keeps your machine awake **only while an agent turn is actually running** — Claude Code, OpenCode or
+DeepSeek Harness — not merely because a session is open. Windows, macOS and Linux. One file of node,
+no dependencies, no Electron, no tray.
 
 The display is left alone, so the screen still sleeps on its own timer. A *user-initiated* sleep
 (lid close, power button) still wins.
@@ -70,6 +71,51 @@ OpenCode 1 is supported through the plugin's `server()` export: a busy `session.
 `node opencode/selftest.mjs` drives the plugin with a stubbed context against the real script, in a
 temp state dir with no OS lock (`KEEPAWAKE_BACKEND=none`; `keepawake.js selftest` is the one that takes
 the real OS lock unless that variable is set).
+
+## DeepSeek Harness
+
+DeepSeek Harness (DSH) has no Claude Code hook bridge and no OpenCode plugin loader; it installs
+**bundles** — npm packages that declare a Cordis patch. The DSH version is the `deepseek/` package
+(`agentic-keepawake-dsh`): a Cordis plugin that maps DSH's durable session events and live
+`agent/status` onto the same `keepawake.js` CLI. The `opencode/` package cannot load in DSH because
+DSH emits neither OpenCode's `session.execution.*` events nor its plugin API; this bundle is the
+equivalent mapping.
+
+Install the directory in the running profile:
+
+> Install the bundle at `D:\github\agentic-keepawake\deepseek` in this profile.
+
+That is `plugin_manager` → `install_bundle`, which links the checkout and selects the bundle. HMR
+applies it immediately; a profile without HMR needs a restart. Doing it by hand means adding
+`"agentic-keepawake-dsh": "link:D:/github/agentic-keepawake/deepseek"` to the profile's
+`package.json` and its name to `dsh.profile.bundles`. `node` must be on PATH. A copied install can
+point at the script with `config.path` (the full `keepawake.js`); the checkout-linked default is the
+sibling file.
+
+| DSH event | keepawake.js | Claude Code equivalent |
+|---|---|---|
+| `agent/status` → `running` / `idle` | `busy` / `idle` | `UserPromptSubmit` / `Stop` |
+| `turn/start` | `busy` | `UserPromptSubmit` (admission → start gap) |
+| `step/start` | `busy`, only when not already held | re-arms after a reload mid-turn |
+| `tool/call` | `busy` when missing, else `beat` | `PreToolUse` |
+| `tool/result` | `beat` | `PostToolUse` |
+| `turn/end` | `idle`, then `busy` for jobs still running (`dsh-job-<id>`) | `Stop` |
+| `job/registered` | tracked; no holder while the turn covers it | — (a background job outlives its turn) |
+| `job/settled` | `idle` (`dsh-job-<id>`) | — |
+| `session/disposed` / `agent/disposed` | `stop` | `SessionEnd` |
+
+Turn boundaries are the durable `turn/start` / `turn/end` events; `agent/status` releases a turn
+that finished without one. A plugin reloaded mid-turn re-arms on the next `step/start` or tool call.
+Background jobs are covered by the turn marker while the turn runs; a job still running at
+`turn/end` gets its own holder under `dsh-job-<id>`, so an ordinary tool call never spawns one.
+Activity refreshes the job markers this instance owns, so a long job outlives many turns; 45
+minutes with no activity still hits the stale ceiling. Jobs already running when the plugin loads
+are not rediscovered (DSH exposes no owner-relative job inventory), and jobs owned by another agent
+are refreshed only by that plugin instance.
+
+`status`, `pause`, `resume` and the runner watcher are the same `node keepawake.js …` commands.
+`node deepseek/test-plugin.mjs` drives the bundle with a stubbed Cordis context against the real
+script, in a temp state dir with no OS lock.
 
 ## How it works
 
@@ -166,6 +212,9 @@ a real holder end to end in a temp dir on short timers, then the runner watcher 
 ## Status
 
 - **Windows: tested** — selftest passes; no orphaned `powershell` left behind.
+- **DeepSeek Harness: tested on Windows** — `node deepseek/test-plugin.mjs` passes, and the installed
+  bundle held a live turn and a background job. Code changes to a linked bundle load on the next DSH
+  restart.
 - **macOS and Linux: written, not run.** The backends follow the documented behaviour of `caffeinate -w`
   and `systemd-inhibit`, but run `selftest` on each before trusting it.
 - **Modern Standby (Windows):** not handled. If `ES_SYSTEM_REQUIRED` does not survive the display turning

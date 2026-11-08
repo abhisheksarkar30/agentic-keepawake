@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Keep awake">
+  <rect width="64" height="64" rx="14" fill="#1d2433"/>
+  <circle cx="32" cy="28" r="11" fill="none" stroke="#ffcc66" stroke-width="4"/>
+  <g stroke="#ffcc66" stroke-width="4" stroke-linecap="round">
+    <path d="M32 8v6M32 42v6M12 28h6M46 28h6M18 14l4 4M42 38l4 4M46 14l-4 4M22 38l-4 4"/>
+  </g>
+  <path d="M20 52h24" stroke="#7cc4ff" stroke-width="4" stroke-linecap="round"/>
+</svg>
