@@ -37,9 +37,9 @@ The plugin fails at load when it cannot find `keepawake.js`; `node` must be on P
 | OpenCode | keepawake.js | Claude Code equivalent |
 |---|---|---|
 | `prompt` hook | `busy` | `UserPromptSubmit` (admission → start gap) |
-| `session.hook("context")` | `busy` | re-arms on every model call, e.g. after a `/reload` mid-turn |
+| `session.hook("context")` | `busy`, only when not already held | re-arms after a `/reload` mid-turn, no per-step cost |
 | `session.execution.started` | `busy` | `UserPromptSubmit` |
-| `tool execute.before` | `busy` | `PreToolUse` (creates a missing marker, refreshes a present one) |
+| `tool execute.before` | `beat` when held, `busy` when missing | `PreToolUse` |
 | `tool execute.after` | `beat` | `PostToolUse` / `PostToolUseFailure` |
 | `session.execution.succeeded` / `failed` / `interrupted` | `idle` | `Stop` / `StopFailure` |
 | `session.idle` | `idle` | `Stop` (not emitted by every build) |

@@ -33,37 +33,37 @@ function pluginDir() {
   try { return path.dirname(fileURLToPath(import.meta.url)); } catch { return ''; }
 }
 
-// options.path wins; otherwise keepawake.js sits next to this directory.
-let configured = '';
-function scriptPath() {
-  if (configured) return configured;
+// options.path wins; otherwise keepawake.js sits next to this directory. Resolved per plugin
+// instance, because OpenCode can load the same package once per location with different options.
+function resolveScript(options) {
+  if (typeof options?.path === 'string') return options.path;
   const dir = pluginDir();
   return dir ? path.join(dir, '..', 'keepawake.js') : '';
 }
 
-let warned = false;
-
 // Fire-and-forget: these hooks sit in front of every tool call, so they must never wait on the
 // child. A missing marker is a no-op inside keepawake.js, so a late beat cannot resurrect a turn.
-function send(mode, sessionID) {
-  if (!sessionID) return;
-  const file = scriptPath();
-  if (!file || !fs.existsSync(file)) {
-    if (warned) return;
-    warned = true;
-    // No transcript to fail into, so the server log is the only visible surface.
-    console.error(`keepawake: cannot find keepawake.js at "${file || '?'}"; set options.path to its full path.`);
-    return;
-  }
-  const child = spawn('node', [file, mode], { stdio: ['pipe', 'ignore', 'ignore'], windowsHide: true });
-  child.on('error', (e) => {
-    if (warned) return;
-    warned = true;
-    console.error(`keepawake: could not run node ${file}: ${e.message}`);
-  });
-  child.stdin.on('error', () => {}); // keepawake may exit before draining stdin
-  child.stdin.end(JSON.stringify({ session_id: String(sessionID) }));
-  child.unref();
+function makeSend(file) {
+  let warned = false;
+  return (mode, sessionID) => {
+    if (!sessionID) return;
+    if (!file || !fs.existsSync(file)) {
+      if (warned) return;
+      warned = true;
+      // No transcript to fail into, so the server log is the only visible surface.
+      console.error(`keepawake: cannot find keepawake.js at "${file || '?'}"; set options.path to its full path.`);
+      return;
+    }
+    const child = spawn('node', [file, mode], { stdio: ['pipe', 'ignore', 'ignore'], windowsHide: true });
+    child.on('error', (e) => {
+      if (warned) return;
+      warned = true;
+      console.error(`keepawake: could not run node ${file}: ${e.message}`);
+    });
+    child.stdin.on('error', () => {}); // keepawake may exit before draining stdin
+    child.stdin.end(JSON.stringify({ session_id: String(sessionID) }));
+    child.unref();
+  };
 }
 
 const sessionOf = (event) => event?.sessionID || event?.session?.id;
@@ -72,19 +72,19 @@ const shellIdOf = (event) => event?.data?.info?.id || event?.data?.id || event?.
 export default {
   id: 'agentic-keepawake',
   async setup(ctx) {
-    if (typeof ctx.options?.path === 'string') configured = ctx.options.path;
-    const file = scriptPath();
+    const file = resolveScript(ctx.options);
     if (!file || !fs.existsSync(file)) {
       throw new Error(`keepawake: cannot find keepawake.js at "${file || '?'}"; set options.path to its full path.`);
     }
+    const send = makeSend(file);
 
     const owned = new Set(); // keys this instance holds, for the unload cleanup
     const waiting = new Map(); // session -> token of its pending session.wait()
 
-    // `busy` creates the marker when it is missing and touches it when present, so a reload or a
-    // tool call can re-arm a lock that was lost mid-turn.
+    // Creates the marker only when this instance does not hold it yet; keepawake.js touches an
+    // existing marker on `busy`, so re-arming after a reload stays a single call.
     const acquire = (key) => {
-      if (!key) return;
+      if (!key || owned.has(key)) return;
       owned.add(key);
       waiting.delete(key); // an older wait must not release this turn
       send('busy', key);
@@ -107,15 +107,20 @@ export default {
         release(sessionID);
       });
     };
+    // The marker is created once per turn; the wait is re-armed on every execution start, so a
+    // missed terminal event still releases. A reloaded plugin re-arms at the next model dispatch.
     const acquireTurn = (sessionID) => {
+      if (!sessionID) return;
       acquire(sessionID);
       waitRelease(sessionID);
     };
 
     await ctx.session.hook('prompt', (event) => { acquire(sessionOf(event)); });
-    // Fires on every model dispatch, so a plugin reloaded mid-turn re-arms at the next call.
-    await ctx.session.hook('context', (event) => { acquireTurn(sessionOf(event)); });
-    await ctx.tool.hook('execute.before', (event) => { acquire(sessionOf(event)); });
+    await ctx.session.hook('context', (event) => { acquire(sessionOf(event)); });
+    await ctx.tool.hook('execute.before', (event) => {
+      const sessionID = sessionOf(event);
+      if (owned.has(sessionID)) send('beat', sessionID); else acquire(sessionID);
+    });
     await ctx.tool.hook('execute.after', (event) => { send('beat', sessionOf(event)); });
 
     const abort = new AbortController();
@@ -182,6 +187,7 @@ export default {
 
   // OpenCode 1: sessions only (its event stream has no shell events).
   async server() {
+    const send = makeSend(resolveScript());
     return {
       event: async ({ event }) => {
         const p = event?.properties || {};

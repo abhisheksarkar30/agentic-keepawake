@@ -22,27 +22,34 @@ const wait = async (fn, ms = 10000) => {
 const marker = (key) => path.join(dir, `${key}.busy`);
 const held = (key) => fs.existsSync(marker(key));
 
-const hooks = {};
-const events = [];
-const waits = [];
-let wake;
-const ctx = {
-  options: {},
-  session: {
-    hook: async (name, cb) => { hooks[name] = cb; return { dispose() {} }; },
-    wait: ({ sessionID }) => new Promise((resolve) => waits.push({ sessionID, resolve: () => resolve(sessionID) })),
-  },
-  tool: { hook: async (name, cb) => { hooks[name] = cb; return { dispose() {} }; } },
-  event: {
-    subscribe: () => (async function* () {
-      for (;;) {
-        if (events.length) { yield events.shift(); continue; }
-        await new Promise((r) => { wake = r; });
-      }
-    })(),
-  },
-};
-const push = (type, data, created = Date.now()) => { events.push({ type, created, data }); wake?.(); wake = undefined; };
+// Options object for a stubbed OpenCode context. `wait` is optional: a stubbed context without it
+// exercises the plugin's fallback when session.wait does not exist.
+function makeCtx({ wait = true } = {}) {
+  const hooks = {};
+  const events = [];
+  const waits = [];
+  let wake;
+  const ctx = {
+    options: {},
+    session: {
+      hook: async (name, cb) => { hooks[name] = cb; return { dispose() {} }; },
+      ...(wait ? { wait: ({ sessionID }) => new Promise((resolve) => waits.push({ sessionID, resolve: () => resolve(sessionID) })) } : {}),
+    },
+    tool: { hook: async (name, cb) => { hooks[name] = cb; return { dispose() {} }; } },
+    event: {
+      subscribe: () => (async function* () {
+        for (;;) {
+          if (events.length) { yield events.shift(); continue; }
+          await new Promise((r) => { wake = r; });
+        }
+      })(),
+    },
+  };
+  const push = (type, data, created = Date.now()) => { events.push({ type, created, data }); wake?.(); wake = undefined; };
+  return { ctx, hooks, waits, push };
+}
+
+const { ctx, hooks, waits, push } = makeCtx();
 
 async function run() {
   assert.strictEqual(plugin.id, 'agentic-keepawake');
@@ -104,6 +111,14 @@ async function run() {
   assert.ok(await wait(() => held('s4')), 'prompt did not hold before unload');
   cleanup();
   assert.ok(await wait(() => !held('s4')), 'unload left the marker behind');
+
+  // a reloaded instance (new setup, no session.wait) re-arms at the next model dispatch
+  const second = makeCtx({ wait: false });
+  const cleanup2 = await plugin.setup(second.ctx);
+  second.hooks.context({ sessionID: 's5' });
+  assert.ok(await wait(() => held('s5')), 'a reloaded instance did not re-arm at a model dispatch');
+  cleanup2();
+  assert.ok(await wait(() => !held('s5')), 'the reloaded instance did not clear its marker');
 
   // OpenCode 1 mapping
   const v1 = await plugin.server();
