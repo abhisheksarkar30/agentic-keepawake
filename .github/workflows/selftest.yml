@@ -26,3 +26,7 @@ jobs:
         env:
           KEEPAWAKE_BACKEND: ${{ runner.os == 'Linux' && 'none' || '' }}
         run: node keepawake.js selftest
+      - name: OpenCode plugin selftest
+        # Stubbed OpenCode context + the real keepawake.js against a temp state dir and the no-op
+        # backend, so this passes on any runner OS.
+        run: node opencode/selftest.mjs

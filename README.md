@@ -20,8 +20,8 @@ degraded mode.
 
 ## OpenCode
 
-The OpenCode version is `opencode/index.ts` — same holder, same policy, no dependency on the Claude
-hook bridge. Point OpenCode at the directory:
+The OpenCode version is the `opencode/` package (`index.js`, loaded through its `package.json`) — same
+holder, same policy, no dependency on the Claude hook bridge. Point OpenCode at the directory:
 
 ```jsonc
 // ~/.config/opencode/opencode.jsonc
@@ -30,28 +30,41 @@ hook bridge. Point OpenCode at the directory:
 }
 ```
 
-Then `/reload`. If you copy `index.ts` anywhere else, pass the script explicitly:
+Then `/reload`. If you copy the package anywhere else, pass the script explicitly:
 `{ "package": "<dir>", "options": { "path": "D:/github/agentic-keepawake/keepawake.js" } }`.
 The plugin fails at load when it cannot find `keepawake.js`; `node` must be on PATH.
 
 | OpenCode | keepawake.js | Claude Code equivalent |
 |---|---|---|
-| `session.execution.started` | `busy` | `UserPromptSubmit` |
 | `prompt` hook | `busy` | `UserPromptSubmit` (admission → start gap) |
-| `tool execute.before` | `beat` | `PreToolUse` |
+| `session.hook("context")` | `busy` | re-arms on every model call, e.g. after a `/reload` mid-turn |
+| `session.execution.started` | `busy` | `UserPromptSubmit` |
+| `tool execute.before` | `busy` | `PreToolUse` (creates a missing marker, refreshes a present one) |
 | `tool execute.after` | `beat` | `PostToolUse` / `PostToolUseFailure` |
 | `session.execution.succeeded` / `failed` / `interrupted` | `idle` | `Stop` / `StopFailure` |
 | `session.idle` | `idle` | `Stop` (not emitted by every build) |
 | `session.deleted` | `stop` | `SessionEnd` |
+| `shell.created` | `busy` (`opencode-shell-<id>`) | — |
+| `shell.exited` / `shell.deleted` | `idle` (`opencode-shell-<id>`) | — |
 
 Turn boundaries come from `session.execution.*`, **not** `session.idle`: OpenCode 2.2.5 emits no
 `session.idle` when a headless turn finishes, so keying off it alone leaves the lock held until the
 45-minute stale ceiling. Interrupting a turn fires `execution.interrupted`, so Esc releases in seconds
-— the Claude hook path has to wait for the stale ceiling there.
+— the Claude hook path has to wait for the stale ceiling there. `session.wait()` is a second release
+path in case a build skips the terminal event. Unloading the plugin clears its markers instead of
+killing the holders; a reload mid-turn resumes holding at the next model or tool call.
 
-`status`, `pause`, `resume` and the runner watcher are the same `node keepawake.js …` commands. On
-OpenCode 1 (which this plugin does not target), the `claude-code-compat` adapter instead runs
-`hooks/hooks.json` as-is if this repo is one of its roots.
+Background shells get one holder per shell under the synthetic session name `opencode-shell-<id>`:
+the turn that started one can finish while the shell still runs, so the lock follows the shell until
+it exits. Shells already running when the plugin loads are not rediscovered (the plugin context has
+no shell inventory), and a shell that outlives 45 minutes of no tool activity hits the stale ceiling.
+
+OpenCode 1 is supported through the plugin's `server()` export: a busy `session.status` holds, and
+`session.idle` / `session.error` release. V1 has no background-shell events and no `session.wait`.
+
+`status`, `pause`, `resume` and the runner watcher are the same `node keepawake.js …` commands.
+`node opencode/selftest.mjs` drives the plugin with a stubbed context against the real script, in a
+temp state dir with no OS lock (same as `keepawake.js selftest`).
 
 ## How it works
 

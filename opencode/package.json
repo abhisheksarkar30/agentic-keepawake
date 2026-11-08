@@ -1,0 +1,14 @@
+{
+  "name": "opencode-agentic-keepawake",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "description": "OpenCode part of agentic-keepawake: holds an OS sleep lock only while a turn or a background shell is running.",
+  "exports": {
+    ".": "./index.js"
+  },
+  "scripts": {
+    "test": "node selftest.mjs"
+  }
+}
